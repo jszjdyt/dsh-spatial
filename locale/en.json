@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "title": "Spatial Transcriptomics Workbench",
+    "description": "Search and download spatial transcriptomics datasets; import Visium/Stereo-seq/Slide-seq/h5ad; run spatial QC, clustering, spatially variable genes, spatial domains, neighborhood and deconvolution analyses."
+  },
+  "nav": "Spatial",
+  "title": "Spatial Transcriptomics Workbench",
+  "subtitle": "Search · Import · Spatial clustering · SVG · Domains · Deconvolution",
+  "emptyTitle": "No dataset yet",
+  "emptyHint": "Search GEO, import a Visium outs/ folder or h5ad, or load the built-in demo.",
+  "demo": "Load demo",
+  "searchGeo": "GEO search",
+  "importData": "Import",
+  "refresh": "Refresh",
+  "engine": "Engine",
+  "pipeline": "Pipeline",
+  "agentPanel": "Agent",
+  "agentHint": "You can also drive this workbench from the chat with the Agent.",
+  "suggestions": "Next steps",
+  "copyInstruction": "Copy prompt",
+  "copied": "Copied",
+  "activity": "Activity",
+  "overview": "Overview",
+  "spatialMap": "Spatial map",
+  "expression": "Expression",
+  "differential": "DE",
+  "svgTab": "Spatial stats",
+  "domainTab": "Domains",
+  "deconvTab": "Deconvolution",
+  "commTab": "Communication",
+  "records": "Records",
+  "log": "Log"
+}

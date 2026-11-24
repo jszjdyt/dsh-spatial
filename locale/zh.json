@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "title": "空间转录组工作台",
+    "description": "检索下载空间转录组数据、导入 Visium/Stereo-seq/Slide-seq/h5ad，做空间质控/聚类/空间高变基因/空间域/邻域/反卷积与配体受体分析。"
+  },
+  "nav": "空间工作台",
+  "title": "空间转录组工作台",
+  "subtitle": "检索 · 坐标导入 · 空间聚类 · SVG · 空间域 · 反卷积",
+  "emptyTitle": "还没有数据集",
+  "emptyHint": "搜 GEO、导入 Visium outs/ 目录或 h5ad，或载入内置示例立刻试一遍。",
+  "demo": "载入示例数据",
+  "searchGeo": "GEO 检索",
+  "importData": "导入数据",
+  "refresh": "刷新",
+  "engine": "引擎",
+  "pipeline": "分析流程",
+  "agentPanel": "Agent",
+  "agentHint": "也可以在对话里直接让 Agent 操作这个工作台。",
+  "suggestions": "建议下一步",
+  "copyInstruction": "复制指令",
+  "copied": "已复制",
+  "activity": "活动",
+  "overview": "概览",
+  "spatialMap": "空间图",
+  "expression": "表达",
+  "differential": "差异",
+  "svgTab": "空间统计",
+  "domainTab": "域与邻域",
+  "deconvTab": "反卷积",
+  "commTab": "通讯",
+  "records": "记录",
+  "log": "日志"
+}

@@ -1,0 +1,57 @@
+{
+  "name": "dsh-spatial",
+  "version": "0.1.0",
+  "private": true,
+  "description": "空间转录组工作台：GEO 检索下载 → Visium/Stereo-seq/h5ad 导入 → 空间质控/聚类 → 空间高变基因/空间域/邻域/反卷积，Agent 可用同一套工具驱动。",
+  "icon": "icon.svg",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "lib/*.mjs",
+    "lib/*.py",
+    "test/make_fixtures.py",
+    "test/make_demo.py",
+    "README.md",
+    "DESIGN.md",
+    "requirements.txt",
+    "INSTALL.md",
+    "!lib/__pycache__/**",
+    "!lib/*.bak-*",
+    "!lib/impl.mjs.bak-*"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "spatial-transcriptomics",
+    "visium",
+    "stereo-seq",
+    "slide-seq",
+    "moran",
+    "deconvolution"
+  ],
+  "license": "MIT"
+}
