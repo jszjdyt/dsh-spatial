@@ -2,33 +2,41 @@
 # -*- coding: utf-8 -*-
 """dsh-spatial — 空间统计模块（``group="空间统计"``）。
 
-本文件提供 9 个空间统计分析与 5 个可复用绘图入口，**全部为内置实现**
-（只依赖 numpy / scipy / pandas / matplotlib），不依赖 squidpy、SPARK、SPARK-X
-（本机未安装，见 AGENT_BRIEF §1）。
+本文件提供 9 个空间统计分析与 5 个可复用绘图入口。核心统计量优先调用
+**squidpy**（`squidpy.gr.spatial_autocorr` / `nhood_enrichment` / `co_occurrence` /
+`ripley` / `ligrec`），squidpy 不可用时整段回退到原来的 numpy/scipy 内置实现
+（结果信封的 tables/figures/store 键完全一致）。
 
 方法与文献
 ----------
 =====================  ==========================================================
 分析 id                方法与文献
 =====================  ==========================================================
-``morans_svg``         单变量 Moran's I（Moran 1950）+ 正态近似与标签置换
-``gearys_svg``         Geary's C（Geary 1954）+ 标签置换经验 p
-``svg_permutation``    纯标签置换经验 p（SPARK-X 思想，Sun et al. 2021）
-``cross_moran``        双变量 Moran's I（Wartenberg 1985）
-``hotspot``            Getis-Ord Gi*（Getis & Ord 1992），kNN 邻域
-``spatial_gradient``   沿轴投影等频分箱 + 线性趋势检验
-``spatial_corr_pairs`` Pearson 相关 + 邻域乘积一致性（空间共表达）
-``ripley_k``           Ripley's K / L 函数（Ripley 1977）+ CSR 随机点包络
-``gene_autocorr_scan`` 全基因向量化 Moran's I 扫描（稀疏矩阵乘法）
+``morans_svg``         单变量 Moran's I（Moran 1950）：squidpy.gr.spatial_autocorr(mode="moran")
+``gearys_svg``         Geary's C（Geary 1954）：squidpy.gr.spatial_autocorr(mode="geary")
+``svg_permutation``    纯标签置换经验 p（SPARK-X 思想，Sun et al. 2021；内置实现）
+``cross_moran``        双变量 Moran's I（Wartenberg 1985；内置实现）
+``hotspot``            Getis-Ord Gi*（Getis & Ord 1992；内置实现）
+``spatial_gradient``   沿轴投影等频分箱 + 线性趋势检验（内置实现）
+``spatial_corr_pairs`` Pearson 相关 + 邻域乘积一致性（内置实现）
+``ripley_k``           Ripley's K/L（Ripley 1977）：squidpy.gr.ripley(mode="L") + CSR 包络
+``gene_autocorr_scan`` 全基因向量化 Moran's I 扫描（内置实现）
 =====================  ==========================================================
+
+另有 3 个跨模块分析的 squidpy 实现注册在本文件（MATERIALIZE：id/params/needs 与
+sp_domain / sp_lr 中的原实现完全一致，registry 按 MODULES 顺序取第一个，故本文件的
+版本先生效；squidpy 不可用时直接委托回原实现）：
+``nhood_enrichment``   squidpy.gr.nhood_enrichment
+``co_occurrence``      squidpy.gr.co_occurrence
+``ligrec_spatial``     squidpy.gr.ligrec（OmniPath；离线/失败回退内置 LR 库）
 
 空间权重的约定
 --------------
-* 统一使用 :func:`sp_common.spatial_weights`（半径邻接 + 行标准化）；Moran's I /
-  Geary's C 的行标准化版本中 ``S0`` = 权重总和 = 非孤点个数，公式取
-  ``I = (n / S0) * (z' W z) / (z' z)``（Cliff & Ord 1981 的行标准化形式）。
 * 半径来自 ``ctx["neighbor_radius"]``（import 时估计），可用 ``neighbor_radius``
   参数覆盖；缺失时用 ``sp_common.estimate_radius`` 估计。
+* Moran's I / Geary's C 由 ``squidpy.gr.spatial_autocorr(transformation=True)``
+  计算（行标准化权重，Cliff & Ord 1981 的行标准化形式）；空间邻接由
+  ``squidpy.gr.spatial_neighbors_radius`` 构造（老版本回退 ``gr.spatial_neighbors``）。
 * 行和为 0 的孤点：只参与方差、不参与协方差（会在 ``warnings`` 里说明）。
 
 输出约定（DESIGN.md §2.5）
@@ -37,7 +45,7 @@
   JSON 里 ``rows`` 由 ``sp_common.table()`` 截断到 500 行；
 * 图存 ``outdir``、白底、dpi=140、**图上文字全部英文**；
 * 缺前置 → :func:`sp_common.prerequisite`（中文）；参数非法 → ``bad_request``；
-* 随机过程一律 ``np.random.default_rng(0)``（同数据同参数同结果）。
+* 随机过程一律 ``rng/random_state/seed=0``（同数据同参数同结果）。
 """
 
 from __future__ import annotations
@@ -47,6 +55,8 @@ import os
 
 import numpy as np
 import pandas as pd
+
+import sp_common as sc
 
 from sp_common import (
     EngineError,
@@ -74,7 +84,162 @@ except Exception:  # pragma: no cover - scipy 一定存在，纯防御
     cKDTree = None
     _sparse = None
 
+# ---------------------------------------------------------------------------
+# 可选依赖：squidpy / scanpy / anndata（宿主 python3 没有这些包 → 全部回退内置实现）
+# ---------------------------------------------------------------------------
+
+try:
+    import anndata as _anndata
+except Exception:  # noqa: BLE001
+    _anndata = None
+
+try:
+    import scanpy as _scanpy
+except Exception:  # noqa: BLE001
+    _scanpy = None
+
+try:
+    import squidpy as _squidpy
+except Exception:  # noqa: BLE001
+    _squidpy = None
+
+HAS_ANNDATA = _anndata is not None
+HAS_SCANPY = _scanpy is not None
+HAS_SQUIDPY = _squidpy is not None
+
+if HAS_SCANPY:
+    try:
+        _scanpy.settings.verbosity = 0
+    except Exception:  # noqa: BLE001
+        pass
+if HAS_SQUIDPY:  # 压低 squidpy/spatialdata 的 INFO 日志（RichHandler 直连 stderr）
+    try:
+        import logging as _logging
+
+        for _name in ("squidpy", "spatialdata", "spatialdata._logging"):
+            _logging.getLogger(_name).setLevel(_logging.ERROR)
+    except Exception:  # noqa: BLE001
+        pass
+
+#: squidpy 不可用时 method/notes 里的统一口径
+BUILTIN_ONLY_REASON = "内置实现（squidpy 无对应 API）"
+
+
+def _pkg_version(module) -> str:
+    name = getattr(module, "__name__", "") if module is not None else ""
+    if not name:
+        return "?"
+    try:
+        from importlib.metadata import version
+
+        return str(version(name.split(".")[0]))
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def _with_method(payload: dict, method: str, notes=None) -> dict:
+    """在结果信封 summary 里写 ``method``（用了哪个包函数），并可追加 notes。"""
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        payload["summary"] = summary
+    summary["method"] = str(method)
+    if notes:
+        payload["notes"] = [str(item) for item in (payload.get("notes") or [])] + [str(n) for n in notes]
+    return payload
+
+
+def _unique_names(names: list[str], n: int) -> list[str]:
+    """AnnData var/obs 索引必须唯一：重名加 __dup 后缀（对外仍用原名显示）。"""
+    out: list[str] = []
+    seen: dict[str, int] = {}
+    for i in range(int(n)):
+        base = str(names[i]) if i < len(names) else f"GENE{i + 1}"
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        out.append(base if count == 0 else f"{base}__dup{count}")
+    return out
+
+
+def _to_adata(ctx_or_view, *, genes=None, X=None, coords=None, labels=None,
+              label_key: str = "clusters", n_obs: int | None = None):
+    """把工作台 ctx/视图构造成 squidpy 用的 AnnData。
+
+    约定：``var_names = genes``（唯一化）、``obsm["spatial"] = coords``、
+    ``obs[label_key] = labels``（Categorical，squidpy 的分类 API 要求）。
+    """
+    if not HAS_ANNDATA:
+        raise EngineError("internal", "anndata 不可用")
+    if X is not None:
+        arr = np.asarray(X, dtype=np.float32)
+    else:
+        n = int(n_obs if n_obs is not None else np.asarray(coords).shape[0])
+        arr = np.zeros((n, 1), dtype=np.float32)
+    adata = _anndata.AnnData(X=np.array(arr, copy=True))
+    names = genes if genes is not None else [f"GENE{i + 1}" for i in range(arr.shape[1])]
+    adata.var_names = _unique_names([str(g) for g in names], arr.shape[1])
+    if coords is not None:
+        adata.obsm["spatial"] = np.array(np.asarray(coords, dtype=np.float64)[:, :2], copy=True)
+    if labels is not None:
+        adata.obs[str(label_key)] = pd.Categorical([str(v) for v in labels])
+    return adata
+
+
+def _spatial_neighbors_call(adata, kind: str, kwargs: dict) -> None:
+    """调 squidpy 空间邻接：优先 1.8+ 的分方法 API，老版本回退 gr.spatial_neighbors。"""
+    gr = _squidpy.gr
+    specific = {"grid": "spatial_neighbors_grid", "radius": "spatial_neighbors_radius",
+                "knn": "spatial_neighbors_knn"}.get(kind)
+    fn = getattr(gr, specific, None) if specific else None
+    if fn is not None:
+        fn(adata, **kwargs)
+        return
+    legacy = {"grid": dict(coord_type="grid"), "radius": dict(coord_type="generic"),
+              "knn": dict(coord_type="generic")}[kind]
+    gr.spatial_neighbors(adata, **{**legacy, **kwargs})
+
+
+def _attach_spatial_graph(adata, radius: float | None) -> tuple[object, str]:
+    """给 AnnData 挂 spatial_connectivities（radius 优先，失败退化 kNN）。"""
+    n = int(adata.n_obs)
+    errors: list[str] = []
+    attempts: list[tuple[str, dict, str]] = []
+    if radius and float(radius) > 0:
+        attempts.append(("radius", dict(radius=float(radius)),
+                         f"spatial_neighbors_radius(radius={float(radius):.3g})"))
+    attempts.append(("knn", dict(n_neighs=int(max(3, min(6, n - 1)))),
+                     f"spatial_neighbors_knn(n_neighs={int(max(3, min(6, n - 1)))})"))
+    for kind, kwargs, label in attempts:
+        try:
+            _spatial_neighbors_call(adata, kind, kwargs)
+            graph = adata.obsp["spatial_connectivities"]
+            if graph.nnz > 0:
+                return graph, f"squidpy.gr.{label}"
+            errors.append(f"{label}: 邻接为空")
+        except Exception as error:  # noqa: BLE001
+            errors.append(f"{label}: {type(error).__name__}: {error}")
+    raise EngineError("internal", "squidpy 空间邻接构造失败：" + "；".join(errors[:2]))
+
+
+def _graph_stats(graph, n: int) -> dict:
+    """squidpy 邻接图的规模信息（邻接数/平均邻居/孤点）。"""
+    try:
+        nnz_per_row = np.asarray((graph != 0).sum(axis=1)).ravel()
+    except Exception:  # noqa: BLE001
+        nnz_per_row = np.zeros(int(n), dtype=int)
+    return {
+        "n_edges": int(getattr(graph, "nnz", 0)),
+        "mean_neighbors": float(np.mean(nnz_per_row)) if int(n) else 0.0,
+        "n_isolated": int(np.sum(nnz_per_row <= 0)),
+    }
+
+
+def _scanpy_var_names(adata) -> list[str]:
+    return [str(v) for v in adata.var_names]
+
+
 ANALYSIS_GROUP = "空间统计"
+
 
 # 默认随机种子：所有置换 / 模拟都用它，保证可复现
 DEFAULT_SEED = 0
@@ -228,6 +393,28 @@ def _view(ctx: dict, *, need_x: bool = True) -> dict:
     if need_x and x_kind == "counts":
         warnings.append("当前表达矩阵是原始 counts，空间自相关建议先做 normalize（结果可能被测序深度驱动）")
 
+    # 物理块（切片/样本）：空间邻接、中心化、置换都必须按块进行
+    blocks_full, block_names, block_key, block_warn = sc.spatial_blocks(ctx)
+    if len(spot_idx) == n_raw:
+        blocks = [np.asarray(idx, dtype=int) for idx in blocks_full]
+    else:
+        pos = -np.ones(n_raw, dtype=int)
+        pos[spot_idx] = np.arange(n, dtype=int)
+        blocks = []
+        for idx in blocks_full:
+            mapped = pos[np.asarray(idx, dtype=int)]
+            mapped = mapped[mapped >= 0]
+            if mapped.size:
+                blocks.append(mapped)
+    block_warn = list(block_warn or [])
+    if len(blocks) > 1:
+        warnings.append(
+            f"检测到 {len(blocks)} 个物理切片/样本（列「{block_key}」）："
+            "空间邻接按块构造、Moran/Geary 先做块内中心化、置换限制在块内"
+        )
+    if not blocks:
+        blocks = [np.arange(n)]
+
     return {
         "ctx": ctx,
         "coords": coords,
@@ -237,11 +424,16 @@ def _view(ctx: dict, *, need_x: bool = True) -> dict:
         "spot_idx": spot_idx,
         "n": n,
         "n_raw": n_raw,
-        "warnings": warnings,
+        "warnings": warnings + block_warn,
         "X_kind": x_kind,
         "neighbor_radius": _p_float(ctx.get("neighbor_radius"), 0.0),
         "image": ctx.get("image") or {},
         "spots": [str(s) for s in (ctx.get("spots") or [])],
+        "blocks": blocks,
+        "block_names": block_names,
+        "block_key": block_key,
+        "n_blocks": len(blocks),
+        "block_warnings": block_warn,
     }
 
 
@@ -394,14 +586,21 @@ def _resolve_gene_set(
 # ===========================================================================
 
 def _neighbor_radius(view: dict, params: dict) -> float:
-    """空间邻接半径：参数覆盖 > ctx["neighbor_radius"] > 自动估计。"""
+    """空间邻接半径：参数覆盖 > ctx["neighbor_radius"] > 自动估计。
+
+    多切片（物理块 > 1）时 ctx 里的半径是按**合并坐标**估计的（跨片同坐标会把最近邻距离
+    拉到 0 → 退化成 fallback 100），因此改用 ``blocked_radius_estimate`` 按块估计。
+    """
     radius = _p_float(params.get("neighbor_radius"), 0.0)
     if radius > 0:
         return radius
+    blocks = view.get("blocks") or []
+    coords = view["coords"]
+    if len(blocks) > 1:
+        return float(sc.blocked_radius_estimate(coords, blocks))
     radius = _p_float(view.get("neighbor_radius"), 0.0)
     if radius > 0:
         return radius
-    coords = view["coords"]
     if coords.shape[0] <= DENSE_LIMIT or cKDTree is None:
         return float(estimate_radius(coords))
     tree = cKDTree(coords)
@@ -444,12 +643,25 @@ def _radius_graph_large(coords: np.ndarray, radius: float) -> "_sparse.csr_matri
 
 
 def _spatial_weights(view: dict, params: dict) -> tuple["_sparse.csr_matrix", float, dict]:
-    """构造行标准化空间权重矩阵，返回 (W, radius, 信息 dict)。"""
+    """构造行标准化空间权重矩阵，返回 (W, radius, 信息 dict)。
+
+    多切片时按物理块构造（块内建边）：``info`` 里带 blocks / edge_counts 供自检与报告。
+    """
     coords = view["coords"]
+    blocks = view.get("blocks") or [np.arange(coords.shape[0])]
     radius = _neighbor_radius(view, params)
-    info: dict = {"radius": float(radius), "fallback": False}
     n = coords.shape[0]
-    if n <= DENSE_LIMIT or cKDTree is None or _sparse is None:
+    multi = len(blocks) > 1
+    info: dict = {"radius": float(radius), "fallback": False, "blocked": bool(multi),
+                  "n_blocks": int(len(blocks)), "block_key": view.get("block_key"),
+                  "block_names": list(view.get("block_names") or []), "blocks": blocks,
+                  "radius_source": ("blocked_estimate" if multi else "ctx_or_estimate")}
+    if multi:
+        W = sc.blocked_spatial_weights(coords, blocks, radius)
+        info["edge_counts"] = sc.block_edge_counts(W, blocks)
+        if _sparse is None:
+            info["fallback"] = True
+    elif n <= DENSE_LIMIT or cKDTree is None or _sparse is None:
         W = spatial_weights(coords, radius)
     else:
         graph = _radius_graph_large(coords, radius)
@@ -504,11 +716,18 @@ def _submatrix(view: dict, idx: list[int]) -> np.ndarray:
 # 核心统计量
 # ===========================================================================
 
-def _moran_vector(X_sub: np.ndarray, W, n: int, S0: float) -> np.ndarray:
-    """向量化 Moran's I：``I = (n / S0) * (z' W z) / (z' z)``（z 为按列中心化）。"""
+def _moran_vector(X_sub: np.ndarray, W, n: int, S0: float, blocks=None) -> np.ndarray:
+    """向量化 Moran's I：``I = (n / S0) * (z' W z) / (z' z)``。
+
+    多切片：先做**块内中心化**（``sp_common.center_within_blocks``），去掉切片间均值差，
+    避免把「不同切片的基线差异」当成空间自相关/负自相关。
+    """
     if S0 <= 0:
         return np.full(X_sub.shape[1], np.nan)
-    Z = X_sub - X_sub.mean(axis=0, keepdims=True)
+    if blocks is not None and len(blocks) > 1:
+        Z = sc.center_within_blocks(X_sub, blocks)
+    else:
+        Z = X_sub - X_sub.mean(axis=0, keepdims=True)
     ss = np.einsum("ij,ij->j", Z, Z)
     WZ = np.asarray(W @ Z)
     num = np.einsum("ij,ij->j", Z, WZ)
@@ -517,11 +736,17 @@ def _moran_vector(X_sub: np.ndarray, W, n: int, S0: float) -> np.ndarray:
     return I
 
 
-def _geary_vector(X_sub: np.ndarray, W, n: int, S0: float) -> np.ndarray:
-    """向量化 Geary's C：``C = (n-1)/(2 S0) * Σw_ij(x_i-x_j)^2 / Σ(x_i-x̄)^2``。"""
+def _geary_vector(X_sub: np.ndarray, W, n: int, S0: float, blocks=None) -> np.ndarray:
+    """向量化 Geary's C：``C = (n-1)/(2 S0) * Σw_ij(x_i-x_j)^2 / Σ(x_i-x̄)^2``。
+
+    多切片时同样先做块内中心化（与 ``_moran_vector`` 一致）。
+    """
     if S0 <= 0:
         return np.full(X_sub.shape[1], np.nan)
-    Z = X_sub - X_sub.mean(axis=0, keepdims=True)
+    if blocks is not None and len(blocks) > 1:
+        Z = sc.center_within_blocks(X_sub, blocks)
+    else:
+        Z = X_sub - X_sub.mean(axis=0, keepdims=True)
     ss = np.einsum("ij,ij->j", Z, Z)
     rowsum = np.asarray(W.sum(axis=1)).ravel().astype(float)
     colsum = np.asarray(W.sum(axis=0)).ravel().astype(float)
@@ -556,35 +781,59 @@ def _perm_budget(perms: int, n_genes: int, W, warn: list[str], label: str) -> tu
     return perms, max_genes
 
 
+def _perm_index(n: int, blocks, rng) -> np.ndarray:
+    """置换索引：多切片时只在块内打乱（``sp_common.within_block_permutation``）。"""
+    if blocks is not None and len(blocks) > 1:
+        return sc.within_block_permutation(blocks, n, rng)
+    return rng.permutation(int(n))
+
+
 def _moran_permutation(X_sub: np.ndarray, W, n: int, S0: float, observed: np.ndarray,
-                       perms: int, rng) -> tuple[np.ndarray, np.ndarray]:
-    """标签置换零分布（Moran's I）。返回 (单侧经验 p, 零分布矩阵 perms×g)。"""
+                       perms: int, rng, blocks=None) -> tuple[np.ndarray, np.ndarray]:
+    """标签置换零分布（Moran's I）。返回 (单侧经验 p, 零分布矩阵 perms×g)。
+
+    多切片：置换限制在块内（不交换切片间标签），否则零分布会把切片效应当成空间信号。
+    """
     g = X_sub.shape[1]
     null = np.empty((perms, g), dtype=float)
     for b in range(perms):
-        perm = rng.permutation(n)
+        perm = _perm_index(n, blocks, rng)
         Z = X_sub[perm]
-        Z = Z - Z.mean(axis=0, keepdims=True)
+        if blocks is not None and len(blocks) > 1:
+            Z = sc.center_within_blocks(Z, blocks)
+        else:
+            Z = Z - Z.mean(axis=0, keepdims=True)
         ss = np.einsum("ij,ij->j", Z, Z)
         num = np.einsum("ij,ij->j", Z, np.asarray(W @ Z))
         with np.errstate(divide="ignore", invalid="ignore"):
             null[b] = np.where(ss > EPS, (float(n) / float(S0)) * num / ss, np.nan)
-    # 单侧（正空间自相关）经验 p：置换分布中 ≥ 观测值的比例
-    ge = np.nansum(null >= observed[None, :], axis=0)
-    pvals = (ge + 1.0) / (float(perms) + 1.0)
+    # 单侧（正空间自相关）经验 p：置换分布中 ≥ 观测值的比例。
+    # 观测值/零分布无效（如块内无方差）时给 NaN，而不是 1/(perms+1) 的假显著。
+    finite_null = np.isfinite(null)
+    valid_perms = finite_null.sum(axis=0)
+    ge = np.where(finite_null & np.isfinite(observed)[None, :],
+                  null >= observed[None, :], False).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pvals = np.where(valid_perms > 0, (ge + 1.0) / (valid_perms + 1.0), np.nan)
+    pvals = np.where(np.isfinite(observed), pvals, np.nan)
     return _clip_p(pvals), null
 
 
 def _geary_permutation(X_sub: np.ndarray, W, n: int, S0: float, observed: np.ndarray,
-                       perms: int, rng) -> tuple[np.ndarray, np.ndarray]:
-    """标签置换零分布（Geary's C）。返回 (单侧经验 p, 零分布矩阵)。"""
+                       perms: int, rng, blocks=None) -> tuple[np.ndarray, np.ndarray]:
+    """标签置换零分布（Geary's C）。返回 (单侧经验 p, 零分布矩阵)；多切片时块内置换。"""
     g = X_sub.shape[1]
     null = np.empty((perms, g), dtype=float)
     for b in range(perms):
-        perm = rng.permutation(n)
-        null[b] = _geary_vector(X_sub[perm], W, n, S0)
-    le = np.nansum(null <= observed[None, :], axis=0)
-    pvals = (le + 1.0) / (float(perms) + 1.0)
+        perm = _perm_index(n, blocks, rng)
+        null[b] = _geary_vector(X_sub[perm], W, n, S0, blocks=blocks)
+    finite_null = np.isfinite(null)
+    valid_perms = finite_null.sum(axis=0)
+    le = np.where(finite_null & np.isfinite(observed)[None, :],
+                  null <= observed[None, :], False).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pvals = np.where(valid_perms > 0, (le + 1.0) / (valid_perms + 1.0), np.nan)
+    pvals = np.where(np.isfinite(observed), pvals, np.nan)
     return _clip_p(pvals), null
 
 
@@ -951,6 +1200,83 @@ def _render_cross_moran_map(view: dict, ia: int, ib: int, values_b_lag: np.ndarr
     return save_fig(fig, outdir, "cross_moran_map", "Bivariate Moran spatial maps")
 
 
+
+# ===========================================================================
+# squidpy 调用小工具（可选依赖；失败统一回退内置实现）
+# ===========================================================================
+
+def _sq_kwargs(fn, **kwargs) -> dict:
+    """按函数签名过滤 kwargs（squidpy 1.6/1.8 的 rng/seed、n_jobs 等名字不同）。"""
+    try:
+        import inspect
+
+        allowed = set(inspect.signature(fn).parameters)
+        filtered = {k: v for k, v in kwargs.items() if k in allowed}
+        return filtered or dict(kwargs)
+    except Exception:  # noqa: BLE001
+        return dict(kwargs)
+
+
+def _require_squidpy() -> None:
+    if not HAS_SQUIDPY:
+        raise EngineError("internal", "squidpy 不可用")
+
+
+def _autocorr_squidpy(view: dict, params: dict, idx: list[int], names: list[str], *,
+                      mode: str, perms: int, warn: list[str]) -> dict:
+    """squidpy.gr.spatial_autocorr（mode=moran/geary）→ 结果 dict。
+
+    返回 {"df","radius","graph_label","gstats","perms"}；df 的行顺序与 ``idx`` 一致。
+    """
+    _require_squidpy()
+    radius = _neighbor_radius(view, params)
+    X_sub = _submatrix(view, idx)
+    adata = _to_adata(view, genes=names, X=X_sub, coords=view["coords"])
+    graph, graph_label = _attach_spatial_graph(adata, radius)
+    gstats = _graph_stats(graph, view["n"])
+    if gstats["n_isolated"] > 0:
+        warn.append(
+            f"{gstats['n_isolated']} 个 spot 没有任何邻居（权重行和为 0），只参与方差、不参与协方差，"
+            "可能低估空间自相关"
+        )
+    unique = _scanpy_var_names(adata)
+    use_perms = int(perms) if int(perms) > 0 else None
+    fn = _squidpy.gr.spatial_autocorr
+    kwargs = _sq_kwargs(fn, mode=mode, genes=unique, n_perms=use_perms, n_jobs=1,
+                        rng=DEFAULT_SEED, seed=DEFAULT_SEED, show_progress_bar=False, copy=True)
+    df = fn(adata, **kwargs)
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise EngineError("internal", "squidpy.gr.spatial_autocorr 没有返回结果表")
+    try:
+        df = df.reindex(unique)
+    except Exception:  # noqa: BLE001
+        pass
+    if len(df) != len(names):
+        raise EngineError("internal", f"squidpy 返回 {len(df)} 行，与请求的 {len(names)} 个基因不一致")
+    return {"df": df, "radius": float(radius), "graph_label": graph_label,
+            "gstats": gstats, "perms": use_perms}
+
+
+def _fdr_from_squidpy(df: pd.DataFrame, fallback: np.ndarray) -> np.ndarray:
+    """取 squidpy 的 BH-FDR 列（优先置换 p 的 FDR，其次解析 p 的 FDR）。"""
+    for col in ("pval_sim_fdr_bh", "pval_norm_fdr_bh"):
+        if col in df.columns:
+            values = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+            if np.isfinite(values).any():
+                return values
+    return np.asarray(bh_fdr(np.asarray(fallback, dtype=float)), dtype=float)
+
+
+def _z_from_norm(stat: np.ndarray, expected: float, df: pd.DataFrame) -> np.ndarray:
+    """解析正态近似的 z：z = (stat - E[stat]) / sqrt(var_norm)（squidpy 不直接给 z）。"""
+    if "var_norm" not in df.columns:
+        return np.full(np.asarray(stat).shape, np.nan)
+    var = pd.to_numeric(df["var_norm"], errors="coerce").to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = np.where(np.isfinite(var) & (var > EPS), (np.asarray(stat, dtype=float) - expected) / np.sqrt(var), np.nan)
+    return z
+
+
 # ===========================================================================
 # 1. morans_svg — Moran's I
 # ===========================================================================
@@ -976,7 +1302,10 @@ def _moran_frame(view: dict, idx: list[int], names: list[str], W, radius: float,
     S0 = float(stats["S0"])
     if S0 <= 0:
         raise prerequisite("空间权重矩阵全为 0（spot 坐标过密或邻接半径过小），无法计算空间自相关")
-    observed = _moran_vector(X_sub, W, n, S0)
+    blocks = view.get("blocks") or []
+    if len(blocks) > 1:
+        warn.append("多切片：Moran's I 已按切片内中心化，解析正态近似只作参考；显著性以块内置换 p 为准")
+    observed = _moran_vector(X_sub, W, n, S0, blocks=blocks)
     expected = float(stats["expected"])
     variance = float(stats["variance"])
     if math.isfinite(variance) and variance > 0:
@@ -994,7 +1323,7 @@ def _moran_frame(view: dict, idx: list[int], names: list[str], W, radius: float,
     null = np.zeros((0, len(idx)))
     if perms_eff > 0 and perm_genes > 0:
         p_sub, null = _moran_permutation(X_sub[:, :perm_genes], W, n, S0, observed[:perm_genes],
-                                         perms_eff, rng)
+                                         perms_eff, rng, blocks=blocks)
         p_perm[:perm_genes] = p_sub
         if perm_genes < len(idx):
             warn.append(f"置换 p 只覆盖前 {perm_genes} 个基因，其余基因 p_perm 为空")
@@ -1024,7 +1353,7 @@ def _norm_sf(x) -> np.ndarray:
     return np.asarray(stats.norm.sf(np.asarray(x, dtype=float)), dtype=float)
 
 
-def run_morans_svg(ctx: dict, params: dict, outdir: str) -> dict:
+def _run_morans_svg_builtin(ctx: dict, params: dict, outdir: str) -> dict:
     """空间自相关（Moran's I）：Moran 1950 + 正态近似 / 标签置换（内置实现）。
 
     行标准化邻接权重（半径邻接）下 ``I = (n/S0)·(z'Wz)/(z'z)``；期望 ``-1/(n-1)``，
@@ -1108,6 +1437,125 @@ def run_morans_svg(ctx: dict, params: dict, outdir: str) -> dict:
     return payload
 
 
+
+
+def _run_morans_svg_squidpy(ctx: dict, params: dict, outdir: str) -> dict:
+    """squidpy 版 Moran's I：squidpy.gr.spatial_autocorr(mode="moran")。"""
+    ensure_dir(outdir)
+    params = dict(params or {})
+    view = _view(ctx)
+    warn = list(view["warnings"])
+    n_top = max(1, min(2000, _p_int(params.get("n_top"), 20)))
+    min_expr = max(0.0, _p_float(params.get("min_expr"), 0.1))
+    perms = max(0, min(5000, _p_int(params.get("permutations"), 100)))
+    idx, names, pick_warn = _resolve_gene_set(view, params, n_top=n_top, min_expr=min_expr, default_n=20)
+    if pick_warn:
+        warn.append(pick_warn)
+    res = _autocorr_squidpy(view, params, idx, names, mode="moran", perms=perms, warn=warn)
+    df = res["df"]
+    n = view["n"]
+    expected = -1.0 / (n - 1) if n > 1 else 0.0
+    stat = pd.to_numeric(df["I"], errors="coerce").to_numpy(dtype=float)
+    p_norm = (pd.to_numeric(df["pval_norm"], errors="coerce").to_numpy(dtype=float)
+              if "pval_norm" in df.columns else np.full(len(df), np.nan))
+    p_perm = (pd.to_numeric(df["pval_sim"], errors="coerce").to_numpy(dtype=float)
+              if "pval_sim" in df.columns else np.full(len(df), np.nan))
+    z = _z_from_norm(stat, float(expected), df)
+    X_sub = _submatrix(view, idx)
+    frame = pd.DataFrame({
+        "gene": list(names),
+        "moran_i": stat,
+        "expected": float(expected),
+        "z": z,
+        "p": _clip_p(np.where(np.isfinite(p_norm), p_norm, np.nan)),
+        "p_perm": _clip_p(np.where(np.isfinite(p_perm), p_perm, np.nan)),
+        "mean": X_sub.mean(axis=0),
+        "n_spots": int(n),
+        "neighbor_radius": float(res["radius"]),
+    })
+    fallback_p = np.where(np.isfinite(frame["p_perm"].to_numpy(dtype=float)),
+                          frame["p_perm"].to_numpy(dtype=float), frame["p"].to_numpy(dtype=float))
+    frame["p_adj"] = _fdr_from_squidpy(df, fallback_p)
+    frame = frame.sort_values("moran_i", ascending=False, na_position="last").reset_index(drop=True)
+    frame_path = export_csv(frame, outdir, "morans_svg", index=False)
+
+    figures: list[dict] = []
+    top_rows = frame.dropna(subset=["moran_i"]).head(4)
+    if len(top_rows):
+        try:
+            figures.append(_render_svg_map(view, [int(np.where(np.asarray(names) == g)[0][0]) for g in top_rows["gene"]],
+                                           [str(g) for g in top_rows["gene"]], outdir, params))
+        except Exception as error:  # noqa: BLE001
+            warn.append(f"svg_map 绘制失败：{error}")
+    try:
+        figures.append(_render_moran_plot(frame, outdir))
+    except Exception as error:  # noqa: BLE001
+        warn.append(f"moran_plot 绘制失败：{error}")
+
+    gstats = res["gstats"]
+    n_sig_pos = int(((frame["p_adj"].fillna(1.0) < 0.05) & (frame["moran_i"] > 0)).sum())
+    bullets = [
+        f"对 {len(frame)} 个基因计算 Moran's I（行标准化半径邻接，半径 {res['radius']:.3g}，"
+        f"{n} 个 spot，平均邻居 {gstats['mean_neighbors']:.2f}）",
+        f"FDR<0.05 且 I>0 的显著空间高变基因：{n_sig_pos} 个"
+        + (f"，最强为「{frame.iloc[0]['gene']}」（I={frame.iloc[0]['moran_i']:.3f}）" if len(frame) else ""),
+    ]
+    if res["perms"]:
+        bullets.append(f"置换检验 {res['perms']} 次（squidpy 单侧经验 p，seed=0）")
+    metrics = {
+        "n_genes": int(len(frame)),
+        "n_significant": n_sig_pos,
+        "top_gene": str(frame.iloc[0]["gene"]) if len(frame) else None,
+        "top_moran_i": float(frame.iloc[0]["moran_i"]) if len(frame) else None,
+        "n_spots": int(n),
+        "neighbor_radius": float(res["radius"]),
+        "permutations": int(perms),
+        "n_isolated": int(gstats["n_isolated"]),
+    }
+    method_text = (f"squidpy.gr.spatial_autocorr(mode=moran, n_perms={res['perms']}, n_jobs=1, rng=0)"
+                   f" + {res['graph_label']}（squidpy {_pkg_version(_squidpy)}）")
+    payload = result(
+        title="空间自相关（Moran's I）",
+        bullets=bullets,
+        metrics=metrics,
+        tables=[table("svg", "空间高变基因（Moran's I）", _MORAN_COLUMNS, frame,
+                      note="I>0 表示空间聚集；p 为解析正态近似双尾，p_perm 为 squidpy 单侧置换经验 p；p_adj 取 squidpy 的 BH-FDR 列")],
+        figures=figures,
+        warnings=warn,
+        notes=[f"方法：{method_text}；空间邻接 {res['graph_label']}，行标准化权重（transformation=True）。"],
+        data_out=[data_file("svg_csv", frame_path, "Moran's I 表")],
+    )
+    payload["store"] = {
+        "morans_svg": {
+            "genes": [str(g) for g in frame["gene"].head(200)],
+            "table": jsonable(frame.head(500)),
+            "params": {"n_top": n_top, "permutations": int(perms), "min_expr": min_expr},
+            "neighbor_radius": float(res["radius"]),
+        }
+    }
+    return _with_method(payload, method_text, notes=[f"后端函数：{method_text}"])
+
+
+def run_morans_svg(ctx: dict, params: dict, outdir: str) -> dict:
+    """空间自相关（Moran's I）：优先 squidpy.gr.spatial_autocorr，失败回退内置实现。"""
+    if HAS_SQUIDPY and HAS_ANNDATA:
+        try:
+            return _run_morans_svg_squidpy(ctx, params, outdir)
+        except EngineError as error:
+            if error.code not in ("internal",):
+                raise
+            payload = _run_morans_svg_builtin(ctx, params, outdir)
+            payload.setdefault("warnings", []).append(
+                f"squidpy Moran's I 调用失败（{error.message}），已回退内置实现")
+            return _with_method(payload, "回退内置实现（squidpy 调用失败）：Moran's I")
+        except Exception as error:  # noqa: BLE001 - 任何包异常都回退，保证分析可交付
+            payload = _run_morans_svg_builtin(ctx, params, outdir)
+            payload.setdefault("warnings", []).append(
+                f"squidpy Moran's I 调用失败（{type(error).__name__}: {error}），已回退内置实现")
+            return _with_method(payload, "回退内置实现（squidpy 调用失败）：Moran's I")
+    return _with_method(_run_morans_svg_builtin(ctx, params, outdir),
+                        "回退内置实现（squidpy 不可用）：Moran's I")
+
 # ===========================================================================
 # 2. gearys_svg — Geary's C
 # ===========================================================================
@@ -1124,7 +1572,7 @@ _GEARY_COLUMNS = [
 ]
 
 
-def run_gearys_svg(ctx: dict, params: dict, outdir: str) -> dict:
+def _run_gearys_svg_builtin(ctx: dict, params: dict, outdir: str) -> dict:
     """空间自相关（Geary's C）：Geary 1954 + 标签置换经验 p（内置实现）。
 
     ``C = (n-1)/(2S0) · Σw_ij(x_i-x_j)² / Σ(x_i-x̄)²``；E[C]=1，C<1 表示相邻
@@ -1152,13 +1600,16 @@ def run_gearys_svg(ctx: dict, params: dict, outdir: str) -> dict:
     X_sub = _submatrix(view, idx)
     n = view["n"]
     S0 = float(stats["S0"])
-    observed = _geary_vector(X_sub, W, n, S0)
+    blocks = view.get("blocks") or []
+    if len(blocks) > 1:
+        warn.append("多切片：Geary's C 已按切片内中心化，显著性以块内置换 p 为准")
+    observed = _geary_vector(X_sub, W, n, S0, blocks=blocks)
     perms_eff, perm_genes = _perm_budget(perms, len(idx), W, warn, "Geary's C")
     z = np.full(observed.shape, np.nan)
     p_perm = np.full(observed.shape, np.nan)
     if perms_eff > 0 and perm_genes > 0:
         p_sub, null = _geary_permutation(X_sub[:, :perm_genes], W, n, S0, observed[:perm_genes],
-                                         perms_eff, np.random.default_rng(DEFAULT_SEED))
+                                         perms_eff, np.random.default_rng(DEFAULT_SEED), blocks=blocks)
         p_perm[:perm_genes] = p_sub
         with np.errstate(invalid="ignore"):
             mean_null = np.nanmean(null, axis=0)
@@ -1194,8 +1645,10 @@ def run_gearys_svg(ctx: dict, params: dict, outdir: str) -> dict:
             # 为直方图重算一次零分布（仅当置换基因数不多时，成本可接受）
             if perms_eff > 0 and perm_genes > 0:
                 sub = _submatrix(view, idx[:perm_genes])
-                _, null = _geary_permutation(sub, W, n, S0, _geary_vector(sub, W, n, S0), perms_eff,
-                                             np.random.default_rng(DEFAULT_SEED))
+                _, null = _geary_permutation(sub, W, n, S0,
+                                             _geary_vector(sub, W, n, S0, blocks=blocks),
+                                             perms_eff, np.random.default_rng(DEFAULT_SEED),
+                                             blocks=blocks)
                 pos = names.index(str(top["gene"]))
                 if pos < perm_genes:
                     figures.append(_render_permutation(null[:, pos], np.array([float(top["geary_c"])]),
@@ -1234,6 +1687,108 @@ def run_gearys_svg(ctx: dict, params: dict, outdir: str) -> dict:
     return payload
 
 
+
+
+def _run_gearys_svg_squidpy(ctx: dict, params: dict, outdir: str) -> dict:
+    """squidpy 版 Geary's C：squidpy.gr.spatial_autocorr(mode="geary")。"""
+    ensure_dir(outdir)
+    params = dict(params or {})
+    view = _view(ctx)
+    warn = list(view["warnings"])
+    n_top = max(1, min(2000, _p_int(params.get("n_top"), 20)))
+    min_expr = max(0.0, _p_float(params.get("min_expr"), 0.1))
+    perms = max(0, min(5000, _p_int(params.get("permutations"), 99)))
+    idx, names, pick_warn = _resolve_gene_set(view, params, n_top=n_top, min_expr=min_expr, default_n=20)
+    if pick_warn:
+        warn.append(pick_warn)
+    res = _autocorr_squidpy(view, params, idx, names, mode="geary", perms=perms, warn=warn)
+    df = res["df"]
+    n = view["n"]
+    expected = 1.0
+    stat = pd.to_numeric(df["C"], errors="coerce").to_numpy(dtype=float)
+    p_norm = (pd.to_numeric(df["pval_norm"], errors="coerce").to_numpy(dtype=float)
+              if "pval_norm" in df.columns else np.full(len(df), np.nan))
+    p_perm = (pd.to_numeric(df["pval_sim"], errors="coerce").to_numpy(dtype=float)
+              if "pval_sim" in df.columns else np.full(len(df), np.nan))
+    z = _z_from_norm(stat, float(expected), df)
+    X_sub = _submatrix(view, idx)
+    frame = pd.DataFrame({
+        "gene": list(names),
+        "geary_c": stat,
+        "expected": float(expected),
+        "z": z,
+        "p_perm": _clip_p(np.where(np.isfinite(p_perm), p_perm, np.nan)),
+        "mean": X_sub.mean(axis=0),
+        "n_spots": int(n),
+        "neighbor_radius": float(res["radius"]),
+    })
+    fallback_p = np.where(np.isfinite(frame["p_perm"].to_numpy(dtype=float)),
+                          frame["p_perm"].to_numpy(dtype=float), p_norm)
+    frame["p_adj"] = _fdr_from_squidpy(df, fallback_p)
+    frame = frame.sort_values("geary_c", ascending=True, na_position="last").reset_index(drop=True)
+    frame_path = export_csv(frame, outdir, "gearys_svg", index=False)
+
+    figures: list[dict] = []
+    try:
+        figures.append(_render_geary_plot(frame, outdir))
+    except Exception as error:  # noqa: BLE001
+        warn.append(f"geary_plot 绘制失败：{error}")
+
+    gstats = res["gstats"]
+    n_sig = int(((frame["p_adj"].fillna(1.0) < 0.05) & (frame["geary_c"] < 1.0)).sum())
+    bullets = [
+        f"对 {len(frame)} 个基因计算 Geary's C（行标准化半径邻接，半径 {res['radius']:.3g}，{n} 个 spot）",
+        f"C<1 且 FDR<0.05 的显著空间聚集基因：{n_sig} 个"
+        + (f"，最小 C 为「{frame.iloc[0]['gene']}」（C={frame.iloc[0]['geary_c']:.3f}）" if len(frame) else ""),
+        f"经验 p 来自 {res['perms'] or 0} 次 squidpy 标签置换（单侧，seed=0）",
+    ]
+    metrics = {
+        "n_genes": int(len(frame)),
+        "n_significant": n_sig,
+        "min_geary_c": float(frame["geary_c"].min()) if len(frame) else None,
+        "min_gene": str(frame.iloc[0]["gene"]) if len(frame) else None,
+        "n_spots": int(n),
+        "neighbor_radius": float(res["radius"]),
+        "permutations": int(perms),
+    }
+    method_text = (f"squidpy.gr.spatial_autocorr(mode=geary, n_perms={res['perms']}, n_jobs=1, rng=0)"
+                   f" + {res['graph_label']}（squidpy {_pkg_version(_squidpy)}）")
+    payload = result(
+        title="空间自相关（Geary's C）",
+        bullets=bullets,
+        metrics=metrics,
+        tables=[table("geary", "空间高变基因（Geary's C）", _GEARY_COLUMNS, frame,
+                      note="C<1 表示相邻 spot 表达接近（空间聚集），E[C]=1；p 为 squidpy 单侧置换经验 p；p_adj 取 squidpy 的 BH-FDR 列")],
+        figures=figures,
+        warnings=warn,
+        notes=[f"方法：{method_text}；空间邻接 {res['graph_label']}，行标准化权重（transformation=True）。",
+               "z 由 squidpy 的解析方差列 var_norm 反解：z=(C-E[C])/sqrt(var_norm)"],
+        data_out=[data_file("geary_csv", frame_path, "Geary's C 表")],
+    )
+    payload["store"] = {"gearys_svg": {"genes": [str(g) for g in frame["gene"].head(200)]}}
+    return _with_method(payload, method_text, notes=[f"后端函数：{method_text}"])
+
+
+def run_gearys_svg(ctx: dict, params: dict, outdir: str) -> dict:
+    """空间自相关（Geary's C）：优先 squidpy.gr.spatial_autocorr，失败回退内置实现。"""
+    if HAS_SQUIDPY and HAS_ANNDATA:
+        try:
+            return _run_gearys_svg_squidpy(ctx, params, outdir)
+        except EngineError as error:
+            if error.code not in ("internal",):
+                raise
+            payload = _run_gearys_svg_builtin(ctx, params, outdir)
+            payload.setdefault("warnings", []).append(
+                f"squidpy Geary's C 调用失败（{error.message}），已回退内置实现")
+            return _with_method(payload, "回退内置实现（squidpy 调用失败）：Geary's C")
+        except Exception as error:  # noqa: BLE001
+            payload = _run_gearys_svg_builtin(ctx, params, outdir)
+            payload.setdefault("warnings", []).append(
+                f"squidpy Geary's C 调用失败（{type(error).__name__}: {error}），已回退内置实现")
+            return _with_method(payload, "回退内置实现（squidpy 调用失败）：Geary's C")
+    return _with_method(_run_gearys_svg_builtin(ctx, params, outdir),
+                        "回退内置实现（squidpy 不可用）：Geary's C")
+
 # ===========================================================================
 # 3. svg_permutation — 纯标签置换
 # ===========================================================================
@@ -1267,8 +1822,12 @@ def run_svg_permutation(ctx: dict, params: dict, outdir: str) -> dict:
     X_sub = _submatrix(view, idx)
     n = view["n"]
     S0 = float(stats["S0"])
-    observed = _moran_vector(X_sub, W, n, S0)
-    p_perm, null = _moran_permutation(X_sub, W, n, S0, observed, perms_eff, np.random.default_rng(DEFAULT_SEED))
+    blocks = view.get("blocks") or []
+    if len(blocks) > 1:
+        warn.append("多切片：置换只在切片内进行（不交换切片间标签）")
+    observed = _moran_vector(X_sub, W, n, S0, blocks=blocks)
+    p_perm, null = _moran_permutation(X_sub, W, n, S0, observed, perms_eff,
+                                      np.random.default_rng(DEFAULT_SEED), blocks=blocks)
     frame = pd.DataFrame({
         "gene": names,
         "moran_i": observed,
@@ -1465,14 +2024,20 @@ def run_cross_moran(ctx: dict, params: dict, outdir: str) -> dict:
 # 5. hotspot — Getis-Ord Gi*
 # ===========================================================================
 
-def _knn_indices(coords: np.ndarray, k: int, warn: list[str]) -> np.ndarray:
-    """kNN 索引（不含自身）。小样本用 sp_common.coord_knn，大样本用 cKDTree 等价实现。"""
-    import sp_common
+def _knn_indices(coords: np.ndarray, k: int, warn: list[str], blocks=None) -> np.ndarray:
+    """kNN 索引（不含自身）。
 
+    * 多切片：按物理块分别取 kNN（``blocked_coord_knn``），邻居不跨片；
+    * 单块小样本：``sp_common.coord_knn``；单块大样本：cKDTree 等价实现。
+    """
     n = coords.shape[0]
+    if blocks is not None and len(blocks) > 1:
+        idx, _dist, k_eff = sc.blocked_coord_knn(coords, blocks, k)
+        warn.append(f"多切片：kNN 邻域限制在切片内（每点 {k_eff} 个邻居，不跨片）")
+        return np.asarray(idx, dtype=int)
     k = int(max(1, min(k, n - 1)))
     if n <= DENSE_LIMIT or cKDTree is None:
-        idx, _ = sp_common.coord_knn(coords, k)
+        idx, _ = sc.coord_knn(coords, k)
         return np.asarray(idx, dtype=int)
     warn.append("spot 数较多，Gi* 邻域改用 cKDTree 的等价 kNN 实现（结果与 coord_knn 一致）")
     tree = cKDTree(coords)
@@ -1520,8 +2085,19 @@ def _hotspot_core(ctx: dict, params: dict, *, allow_auto: bool = True) -> dict:
     values = np.asarray(view["X"][:, gi], dtype=float)
     if float(np.var(values)) <= EPS:
         raise prerequisite(f"基因「{gene}」的表达为常数（无方差），无法计算 Getis-Ord Gi*")
-    knn = _knn_indices(view["coords"], k, warn)
-    z = _gi_star(values, knn)
+    blocks = view.get("blocks") or []
+    knn = _knn_indices(view["coords"], k, warn, blocks=blocks)
+    if len(blocks) > 1:
+        # 多切片：Gi* 统计量按块内部计算（邻域和均值都用本切片的），不混合切片效应
+        z = np.full(view["n"], np.nan, dtype=float)
+        for block in blocks:
+            block = np.asarray(block, dtype=int)
+            if block.size < 3:
+                continue
+            sub_idx = _knn_indices(view["coords"][block], k, warn, blocks=None)
+            z[block] = _gi_star(values[block], sub_idx)
+    else:
+        z = _gi_star(values, knn)
     if not np.isfinite(z).any():
         raise prerequisite(f"基因「{gene}」的 Gi* 统计量全为缺失（表达方差为 0），无法检测热点")
     cats = _hotspot_categories(z, z_thresh)
@@ -2022,13 +2598,24 @@ def _ripley_core(ctx: dict, params: dict) -> dict:
     n_sim = max(0, min(999, _p_int(params.get("n_sim"), 19)))
     coords = view["coords"]
     n = view["n"]
-    xspan = float(np.max(coords[:, 0]) - np.min(coords[:, 0]))
-    yspan = float(np.max(coords[:, 1]) - np.min(coords[:, 1]))
-    area = xspan * yspan
-    if not math.isfinite(area) or area <= EPS:
+    blocks = view.get("blocks") or [np.arange(n)]
+    multi = len(blocks) > 1
+    # 多切片：窗口/配对都在各自块内累计，跨片点对绝不进入 K(r)
+    block_info: list[dict] = []
+    for block in blocks:
+        block = np.asarray(block, dtype=int)
+        if block.size < 3:
+            continue
+        sub = coords[block]
+        lo_b = np.array([float(np.min(sub[:, 0])), float(np.min(sub[:, 1]))])
+        hi_b = np.array([float(np.max(sub[:, 0])), float(np.max(sub[:, 1]))])
+        area_b = float((hi_b[0] - lo_b[0]) * (hi_b[1] - lo_b[1]))
+        if not math.isfinite(area_b) or area_b <= EPS:
+            continue
+        block_info.append({"idx": block, "lo": lo_b, "hi": hi_b, "area": area_b})
+    if not block_info:
         raise prerequisite("空间坐标在一个维度上没有跨度（退化成一条线），无法定义 Ripley's K 的窗口面积")
-    lo = np.array([np.min(coords[:, 0]), np.min(coords[:, 1])])
-    hi = np.array([np.max(coords[:, 0]), np.max(coords[:, 1])])
+    area = float(sum(item["area"] for item in block_info))
     uniq, counts = np.unique(labels.astype(str), return_counts=True)
     order = np.argsort(counts)[::-1]
     uniq, counts = uniq[order], counts[order]
@@ -2038,34 +2625,77 @@ def _ripley_core(ctx: dict, params: dict) -> dict:
     if uniq.size > max_clusters:
         warn.append(f"共 {uniq.size} 个簇，只对 spot 数最多的 {max_clusters} 个计算 Ripley's K")
         uniq, counts = uniq[:max_clusters], counts[:max_clusters]
-    r_max = 0.5 * math.sqrt(area)
+    if multi:
+        warn.append(f"多切片：Ripley's K 按 {len(block_info)} 个切片分别统计窗口内点对后合并（不跨片配对）")
+    # 半径上限取各切片窗口半宽的最小值，避免跨切片的窗口尺寸差异带来边界偏差
+    r_max = 0.5 * math.sqrt(min(item["area"] for item in block_info))
     r_min = r_max / max(8.0, radii_n / 2.0)
     radii = np.linspace(r_min, r_max, radii_n)
     rng = np.random.default_rng(DEFAULT_SEED)
     items: list[dict] = []
     skipped: list[str] = []
     max_points = 4000
-    for label, count in zip(uniq, counts):
-        pts = coords[labels.astype(str) == label]
-        if pts.shape[0] > max_points:
-            sel = rng.choice(pts.shape[0], size=max_points, replace=False)
-            pts = pts[np.sort(sel)]
-            warn.append(f"簇「{label}」spot 数 {int(count)} 过大，Ripley's K 内部下采样到 {max_points} 个")
-        m = pts.shape[0]
-        if m < 5:
-            skipped.append(str(label))
-            continue
-        from scipy.spatial.distance import pdist
+    labels_arr = labels.astype(str)
+    from scipy.spatial.distance import pdist
 
-        d = np.sort(pdist(pts))
-        counts_r = np.searchsorted(d, radii, side="right").astype(float)
-        k_obs = area * counts_r / float(m * (m - 1))
-        k_sims = np.empty((max(n_sim, 0), radii_n), dtype=float)
-        for s in range(max(n_sim, 0)):
-            sim = rng.uniform(lo, hi, size=(m, 2))
-            ds = np.sort(pdist(sim))
-            cs = np.searchsorted(ds, radii, side="right").astype(float)
-            k_sims[s] = area * cs / float(m * (m - 1))
+    def _subsample(pts: np.ndarray, label) -> np.ndarray:
+        if pts.shape[0] <= max_points:
+            return pts
+        sel = rng.choice(pts.shape[0], size=max_points, replace=False)
+        warn.append(f"簇「{label}」spot 数 {int(pts.shape[0])} 过大，Ripley's K 内部下采样到 {max_points} 个")
+        return pts[np.sort(sel)]
+
+    for label, count in zip(uniq, counts):
+        label_mask = labels_arr == str(label)
+        if multi:
+            parts: list[tuple[np.ndarray, float, int, dict]] = []
+            m_total = 0
+            for info in block_info:
+                block = info["idx"]
+                pts = coords[block][label_mask[block]]
+                if pts.shape[0] < 2:
+                    continue
+                pts = _subsample(pts, label)
+                m_b = int(pts.shape[0])
+                if m_b < 2:
+                    continue
+                d = np.sort(pdist(pts))
+                counts_r = np.searchsorted(d, radii, side="right").astype(float)
+                weight_b = float(m_b * (m_b - 1)) / float(info["area"])
+                parts.append((counts_r, weight_b, m_b, info))
+                m_total += m_b
+            if not parts or m_total < 5:
+                skipped.append(str(label))
+                continue
+            denom = float(sum(weight_b for _c, weight_b, _m, _info in parts))
+            counts_total = np.sum([counts_r for counts_r, _w, _m, _i in parts], axis=0)
+            k_obs = counts_total / max(denom, EPS)
+            k_sims = np.empty((max(n_sim, 0), radii_n), dtype=float)
+            for s in range(max(n_sim, 0)):
+                sim_counts = np.zeros(radii_n, dtype=float)
+                for _c, _weight, m_b, info in parts:
+                    sim = rng.uniform(info["lo"], info["hi"], size=(m_b, 2))
+                    ds = np.sort(pdist(sim))
+                    sim_counts += np.searchsorted(ds, radii, side="right").astype(float)
+                k_sims[s] = sim_counts / max(denom, EPS)
+            m = m_total
+        else:
+            info = block_info[0]
+            pts = coords[label_mask]
+            pts = _subsample(pts, label)
+            m = int(pts.shape[0])
+            if m < 5:
+                skipped.append(str(label))
+                continue
+            d = np.sort(pdist(pts))
+            counts_r = np.searchsorted(d, radii, side="right").astype(float)
+            k_obs = info["area"] * counts_r / float(m * (m - 1))
+            k_sims = np.empty((max(n_sim, 0), radii_n), dtype=float)
+            for s in range(max(n_sim, 0)):
+                sim = rng.uniform(info["lo"], info["hi"], size=(m, 2))
+                ds = np.sort(pdist(sim))
+                cs = np.searchsorted(ds, radii, side="right").astype(float)
+                k_sims[s] = info["area"] * cs / float(m * (m - 1))
         if max(n_sim, 0) > 0:
             k_mean = k_sims.mean(axis=0)
             l_sims = np.sqrt(np.maximum(k_sims, 0.0) / math.pi) - radii[None, :]
@@ -2095,7 +2725,7 @@ def _ripley_core(ctx: dict, params: dict) -> dict:
             "n_sim": int(n_sim)}
 
 
-def run_ripley_k(ctx: dict, params: dict, outdir: str) -> dict:
+def _run_ripley_k_builtin(ctx: dict, params: dict, outdir: str) -> dict:
     """Ripley's K/L 函数：Ripley 1977 + 完全空间随机（CSR）包络（内置实现）。
 
     每簇 ``K(r) = A/(m(m-1))·Σ_{i≠j} 1(d_ij ≤ r)``，``L(r)=sqrt(K(r)/π)-r``；
@@ -2184,6 +2814,204 @@ def run_ripley_k(ctx: dict, params: dict, outdir: str) -> dict:
     return payload
 
 
+
+
+def _ripley_squidpy_curves(core: dict, params: dict) -> dict:
+    """squidpy.gr.ripley(mode="L") → 逐簇 K/L 曲线 + CSR 包络（换算到簇内强度）。"""
+    _require_squidpy()
+    view = core["view"]
+    labels = np.asarray(core["labels"], dtype=object)
+    radii_n = int(max(4, min(200, _p_int(params.get("radii"), 20))))
+    n_sim = int(max(0, min(999, _p_int(params.get("n_sim"), 19))))
+    if n_sim <= 0:
+        raise EngineError("internal", "n_sim=0 时 squidpy 无法给出 CSR 包络，交回内置实现")
+    n = int(view["n"])
+    coords = view["coords"]
+    adata = _to_adata(view, coords=coords, labels=labels, label_key="clusters", n_obs=n)
+    fn = _squidpy.gr.ripley
+    kwargs = _sq_kwargs(fn, cluster_key="clusters", mode="L", n_simulations=int(n_sim),
+                        n_steps=int(radii_n), n_observations=int(n), rng=DEFAULT_SEED,
+                        seed=DEFAULT_SEED, n_jobs=1, show_progress_bar=False, copy=True)
+    out = fn(adata, **kwargs)
+    if not isinstance(out, dict) or "L_stat" not in out:
+        raise EngineError("internal", "squidpy.gr.ripley 没有返回 L_stat")
+    bins = np.asarray(out["bins"], dtype=float)
+    l_stat = out["L_stat"]
+    l_sims = out["sims_stat"]
+    l_obs_pivot = l_stat.pivot_table(index="bins", columns="clusters", values="stats",
+                                     aggfunc="mean", observed=True)
+    l_sim_pivot = l_sims.pivot_table(index="bins", columns="simulations", values="stats",
+                                     aggfunc="mean", observed=True)
+    l_obs_pivot = l_obs_pivot.reindex(bins)
+    l_sim_pivot = l_sim_pivot.reindex(bins)
+    label_counts = pd.Series([str(v) for v in labels]).value_counts()
+    # squidpy 的 L 用全局强度 λ=N/Area：K_sq = A·pairs/N²，而单类型定义 K_c = A·pairs/(m(m-1))，
+    # 故 L_c = L_sq · N/sqrt(m(m-1))（L = sqrt(K/π)）。
+    n_obs_sim = int(n)  # 我们给 squidpy 传的 n_observations = N，CSR 强度与观测窗口一致
+    sim_scale = float(n) / math.sqrt(max(n_obs_sim * (n_obs_sim - 1), 1))
+    l_sims_class = np.asarray(l_sim_pivot.to_numpy(dtype=float)) * sim_scale
+    l_csr_mean = np.nanmean(l_sims_class, axis=1)
+    l_lo = np.nanpercentile(l_sims_class, 2.5, axis=1)
+    l_hi = np.nanpercentile(l_sims_class, 97.5, axis=1)
+    n_sim_eff = int(l_sims_class.shape[1])
+    items: list[dict] = []
+    skipped: list[str] = []
+    for label in l_obs_pivot.columns:
+        name = str(label)
+        m = int(label_counts.get(name, 0))
+        if m < 5:
+            skipped.append(name)
+            continue
+        l_obs = np.asarray(l_obs_pivot[label].to_numpy(dtype=float)) * float(n) / math.sqrt(m * (m - 1))
+        k_obs = math.pi * np.square(l_obs)
+        k_csr_mean = math.pi * np.square(l_csr_mean)
+        l_obs_r = l_obs - bins
+        l_csr_r = l_csr_mean - bins
+        l_dev = l_obs - l_csr_mean
+        # 单侧经验 p：CSR 的 L 超过观测的比例（(k+1)/(n_sim+1)）
+        exceed = np.nansum(l_sims_class >= l_obs[:, None], axis=1)
+        p_bin = (exceed + 1.0) / float(n_sim_eff + 1.0)
+        items.append({
+            "label": name,
+            "n": m,
+            "k": k_obs,
+            "k_csr_mean": k_csr_mean,
+            "l_obs": l_obs_r,
+            "l_csr_mean": l_csr_r,
+            "l_dev": l_dev,
+            "l_dev_lo": l_lo - l_csr_mean,
+            "l_dev_hi": l_hi - l_csr_mean,
+            "p_bin": p_bin,
+        })
+    if not items:
+        raise EngineError("internal", "squidpy Ripley 没有可用簇（每簇 spot 数需 ≥ 5）")
+    return {"items": items, "radii": bins, "n_sim": n_sim_eff, "skipped": skipped,
+            "r_min": float(bins[0]), "r_max": float(bins[-1]),
+            "area": float(0.5 * (bins[-1] ** 2)) if bins[-1] > 0 else float("nan")}
+
+
+def _run_ripley_k_squidpy(ctx: dict, params: dict, outdir: str) -> dict:
+    """squidpy 版 Ripley's K/L：squidpy.gr.ripley(mode="L") + CSR 模拟包络。"""
+    ensure_dir(outdir)
+    params = dict(params or {})
+    core = _ripley_core(ctx, params)
+    view, warn = core["view"], list(core["warn"])
+    squid = _ripley_squidpy_curves(core, params)
+    items = squid["items"]
+    radii = squid["radii"]
+    if squid["skipped"]:
+        warn.append("以下簇 spot 数 < 5，已跳过：" + "、".join(squid["skipped"][:8]))
+    rows = []
+    for item in items:
+        for t, radius in enumerate(radii):
+            rows.append({
+                "cluster": item["label"],
+                "n_spots": int(item["n"]),
+                "r": float(radius),
+                "k_obs": float(item["k"][t]),
+                "k_csr_mean": float(item["k_csr_mean"][t]),
+                "l_obs": float(item["l_obs"][t]),
+                "l_dev": float(item["l_dev"][t]),
+                "l_dev_lo": float(item["l_dev_lo"][t]) if np.isfinite(item["l_dev_lo"][t]) else np.nan,
+                "l_dev_hi": float(item["l_dev_hi"][t]) if np.isfinite(item["l_dev_hi"][t]) else np.nan,
+            })
+    frame = pd.DataFrame(rows)
+    frame_path = export_csv(frame, outdir, "ripley_k", index=False)
+
+    figures: list[dict] = []
+    try:
+        figures.append(_render_ripley({"radii": radii, "clusters": items}, outdir))
+    except Exception as error:  # noqa: BLE001
+        warn.append(f"Ripley 曲线绘制失败：{error}")
+
+    dev_table = frame.groupby("cluster", as_index=False).agg(
+        n_spots=("n_spots", "max"), r_max=("r", "max"),
+        l_dev_max=("l_dev", "max"), l_dev_min=("l_dev", "min"))
+    dev_table = dev_table.sort_values("l_dev_max", ascending=False).reset_index(drop=True)
+    # 显著聚集：CSR 单侧 p<0.05 且 L 偏差为正的簇
+    sig = []
+    for item in items:
+        # 单侧经验 p 的最小可达值为 1/(n_sim+1)，故用 <= 0.05 判显著（n_sim>=19 才可能达到）
+        mask = (np.asarray(item["p_bin"]) <= 0.05) & (np.asarray(item["l_dev"]) > 0)
+        if bool(np.any(mask)):
+            sig.append(item["label"])
+    clustered = sig
+    bullets = [
+        f"对 {len(items)} 个簇计算 Ripley's K/L（r ∈ [{squid['r_min']:.3g}, {squid['r_max']:.3g}]，"
+        f"{squid['n_sim']} 次 squidpy CSR 模拟）",
+        "L(r)-r 超出 CSR 包络且 > 0 的簇（空间聚集）：" + ("、".join(clustered[:8]) if clustered else "无"),
+        "说明：squidpy 的 L 以全局强度 λ=N/Area 归一，本表已按簇内强度 λ_c=m/Area 换算（L_c=L_sq·sqrt(N/(m-1))）；"
+        "CSR 包络为同窗口 Poisson 点过程模拟，观测与模拟口径一致",
+    ]
+    if squid["n_sim"] < 19:
+        bullets.append(f"提示：CSR 模拟 {squid['n_sim']} 次偏少（<19），单侧经验 p 最小只能到 "
+                       f"1/(n_sim+1)，显著性判断偏保守；建议 n_sim ≥ 19")
+    metrics = {
+        "n_clusters": int(len(items)),
+        "cluster_key": core["key"],
+        "r_min": squid["r_min"],
+        "r_max": squid["r_max"],
+        "n_sim": squid["n_sim"],
+        "window_area": squid["area"],
+        "clustered_clusters": clustered,
+    }
+    method_text = (f"squidpy.gr.ripley(mode=L, n_simulations={squid['n_sim']}, n_steps={len(radii)}, "
+                   f"rng=0)（squidpy {_pkg_version(_squidpy)}）")
+    payload = result(
+        title="Ripley's K/L 函数",
+        bullets=bullets,
+        metrics=metrics,
+        tables=[
+            table("ripley_curves", "Ripley's K/L 曲线（逐簇逐半径）",
+                  [{"key": "cluster", "label": "簇", "type": "string"},
+                   {"key": "n_spots", "label": "spot 数", "type": "number"},
+                   {"key": "r", "label": "r", "type": "number"},
+                   {"key": "k_obs", "label": "K(r)", "type": "number"},
+                   {"key": "k_csr_mean", "label": "CSR 平均 K", "type": "number"},
+                   {"key": "l_obs", "label": "L(r)", "type": "number"},
+                   {"key": "l_dev", "label": "L(r)-r 偏差", "type": "number"},
+                   {"key": "l_dev_lo", "label": "包络下界", "type": "number"},
+                   {"key": "l_dev_hi", "label": "包络上界", "type": "number"}],
+                  frame, note="l_dev = 观测 L(r)-r − CSR 平均 L(r)-r；包络为 squidpy CSR 模拟的 2.5%~97.5%"),
+            table("ripley_summary", "逐簇偏差汇总",
+                  [{"key": "cluster", "label": "簇", "type": "string"},
+                   {"key": "n_spots", "label": "spot 数", "type": "number"},
+                   {"key": "r_max", "label": "最大 r", "type": "number"},
+                   {"key": "l_dev_max", "label": "L 偏差最大值", "type": "number"},
+                   {"key": "l_dev_min", "label": "L 偏差最小值", "type": "number"}],
+                  dev_table),
+        ],
+        figures=figures,
+        warnings=warn,
+        notes=[f"方法：{method_text}；squidpy 1.8 的 ripley 只提供 F/G/L（无 mode=K），"
+               "L=sqrt(K/π) 可无损反解 K=πL²，故 K 列由 L 还原。"],
+        data_out=[data_file("ripley_csv", frame_path, "Ripley K/L 表")],
+    )
+    payload["store"] = {"ripley_k": {"clusters": [str(i["label"]) for i in items],
+                                     "r_max": squid["r_max"], "n_sim": squid["n_sim"]}}
+    return _with_method(payload, method_text, notes=[f"后端函数：{method_text}"])
+
+
+def run_ripley_k(ctx: dict, params: dict, outdir: str) -> dict:
+    """Ripley's K/L：优先 squidpy.gr.ripley(mode="L")，失败回退内置实现。"""
+    if HAS_SQUIDPY and HAS_ANNDATA:
+        try:
+            return _run_ripley_k_squidpy(ctx, params, outdir)
+        except EngineError as error:
+            if error.code not in ("internal",):
+                raise
+            payload = _run_ripley_k_builtin(ctx, params, outdir)
+            payload.setdefault("warnings", []).append(
+                f"squidpy Ripley 调用失败（{error.message}），已回退内置实现")
+            return _with_method(payload, "回退内置实现（squidpy 调用失败）：Ripley's K/L")
+        except Exception as error:  # noqa: BLE001
+            payload = _run_ripley_k_builtin(ctx, params, outdir)
+            payload.setdefault("warnings", []).append(
+                f"squidpy Ripley 调用失败（{type(error).__name__}: {error}），已回退内置实现")
+            return _with_method(payload, "回退内置实现（squidpy 调用失败）：Ripley's K/L")
+    return _with_method(_run_ripley_k_builtin(ctx, params, outdir),
+                        "回退内置实现（squidpy 不可用）：Ripley's K/L")
+
 # ===========================================================================
 # 9. gene_autocorr_scan — 全基因向量化扫描
 # ===========================================================================
@@ -2254,7 +3082,7 @@ def run_gene_autocorr_scan(ctx: dict, params: dict, outdir: str) -> dict:
     for start in range(0, n_scan, chunk):
         stop = min(start + chunk, n_scan)
         block = np.ascontiguousarray(X_all[:, cand[start:stop]], dtype=np.float64)
-        I[start:stop] = _moran_vector(block, W, n, S0)
+        I[start:stop] = _moran_vector(block, W, n, S0, blocks=view.get("blocks") or [])
     if math.isfinite(variance) and variance > 0:
         with np.errstate(invalid="ignore"):
             z = (I - expected) / math.sqrt(variance)
@@ -2465,12 +3293,436 @@ def run_spatial_stat(ctx: dict, params: dict, outdir: str) -> dict:
     return mapping[aid](ctx, params, outdir)
 
 
+
+
+# ===========================================================================
+# 10-12. squidpy 实现的跨模块分析（nhood / co_occurrence / ligrec）
+#   * id / title / group / needs / params 与 sp_domain / sp_lr 中的原实现**完全一致**
+#     （registry.all_analyses 按 MODULES 顺序 setdefault，sp_spatial 先加载 → 本实现生效）；
+#   * squidpy 不可用或调用失败 → 直接委托回原实现，notes 里写明原因；
+#   * 返回信封的 tables / figures / data_out / store 键与原实现一致。
+# ===========================================================================
+
+_NEIGHBORHOOD_GROUP = "邻域与域"
+_CLUSTER_PARAM = {"key": "cluster_key", "label": "聚类列", "type": "text", "default": "clusters"}
+
+
+def _labels_for(ctx: dict, params: dict) -> tuple[np.ndarray, str, dict]:
+    """取 (标签数组, 列名, 视图)；标签与视图 spot 顺序对齐。"""
+    view = _view(ctx, need_x=False)
+    labels, key = _cluster_labels(ctx, _p_str((params or {}).get("cluster_key")), view["spot_idx"])
+    return labels, key, view
+
+
+def _delegate(module_name: str, func_name: str, ctx: dict, params: dict, outdir: str,
+              method: str, note: str) -> dict:
+    """squidpy 不可用时委托回原模块实现，并补 method/notes。"""
+    import importlib
+
+    module = importlib.import_module(module_name)
+    payload = getattr(module, func_name)(ctx, params, outdir)
+    return _with_method(payload, method, notes=[note])
+
+
+# ---------------------------------------------------------------------------
+# 10. nhood_enrichment → squidpy.gr.nhood_enrichment
+# ---------------------------------------------------------------------------
+
+def _run_nhood_squidpy(ctx: dict, params: dict, outdir: str) -> dict:
+    view = _view(ctx, need_x=False)
+    labels, key = _cluster_labels(ctx, _p_str((params or {}).get("cluster_key")), view["spot_idx"])
+    n_perms = int(max(1, min(_p_int((params or {}).get("n_perms"), 100), 1000)))
+    n_neighbors = int(max(1, _p_int((params or {}).get("n_neighbors"), 6)))
+    adata = _to_adata(view, coords=view["coords"], labels=labels, label_key="clusters",
+                      n_obs=view["n"])
+    _spatial_neighbors_call(adata, "knn", dict(n_neighs=int(min(n_neighbors, adata.n_obs - 1))))
+    fn = _squidpy.gr.nhood_enrichment
+    kwargs = _sq_kwargs(fn, cluster_key="clusters", n_perms=n_perms, n_jobs=1,
+                        rng=DEFAULT_SEED, seed=DEFAULT_SEED, show_progress_bar=False, copy=True)
+    raw = fn(adata, **kwargs)
+    if raw is None:
+        raise EngineError("internal", "squidpy.gr.nhood_enrichment 没有返回结果")
+    z = np.asarray(getattr(raw, "zscore", raw[0] if isinstance(raw, tuple) else raw), dtype=float)
+    counts = np.asarray(getattr(raw, "counts", raw[1] if isinstance(raw, tuple) and len(raw) > 1 else z), dtype=float)
+    uniq = [str(c) for c in adata.obs["clusters"].cat.categories]
+    if z.shape != (len(uniq), len(uniq)):
+        raise EngineError("internal", f"squidpy nhood zscore 形状异常：{z.shape}")
+    # squidpy 返回**有向**类别对计数/z；本表按无序类别对展示 → 计数相加、z 取双向均值
+    observed = counts + counts.T
+    zsym = 0.5 * (z + z.T)
+    res = {
+        "uniq": uniq,
+        "observed": observed,
+        "null_mean": np.full_like(observed, np.nan),
+        "z": zsym,
+        "n_perms": n_perms,
+        "n_neighbors": n_neighbors,
+        "n_spots": int(view["n"]),
+    }
+    import sp_domain
+
+    frame = sp_domain._nhood_table(res)
+    csv_path = export_csv(frame, outdir, "nhood_enrichment", index=False)
+    table_obj = table(
+        "nhood_enrichment", "邻域富集（类别对 z-score）",
+        [{"key": "cluster_a", "label": "类别 A", "type": "string"},
+         {"key": "cluster_b", "label": "类别 B", "type": "string"},
+         {"key": "observed", "label": "观测邻接数", "type": "number"},
+         {"key": "null_mean", "label": "置换均值", "type": "number"},
+         {"key": "z", "label": "z-score", "type": "number"}],
+        frame, note=f"{n_perms} 次标签置换；z>0 表示该类别对在空间上比随机更常相邻（squidpy 有向结果已对称化）")
+    figures: list[dict] = []
+    warnings_list: list[str] = []
+    try:
+        figures.append(sp_domain._nhood_figure(ctx, params or {}, outdir, res=res))
+    except Exception as exc:  # noqa: BLE001
+        warnings_list.append(f"邻域富集热图绘制失败：{exc}")
+    top = frame.head(5)
+    bullets = [
+        f"按「{key}」的 {len(uniq)} 个类别 × {n_neighbors} 近邻统计邻接；{n_perms} 次置换得到 z-score",
+        "最富集的类别对：" + "、".join(
+            f"{r['cluster_a']}-{r['cluster_b']}(z={r['z']:+.2f})" for _, r in top.iterrows()),
+    ]
+    method_text = (f"squidpy.gr.nhood_enrichment(cluster_key={key!r}, n_perms={n_perms}, n_jobs=1, rng=0)"
+                   f"（squidpy {_pkg_version(_squidpy)}）")
+    return _with_method(result(
+        title="邻域富集",
+        bullets=bullets,
+        metrics={
+            "cluster_key": key,
+            "n_categories": int(len(uniq)),
+            "n_perms": n_perms,
+            "n_neighbors": int(res["n_neighbors"]),
+            "max_z": float(np.max(zsym)) if zsym.size else None,
+            "categories": [str(u) for u in uniq],
+        },
+        tables=[table_obj],
+        figures=figures,
+        warnings=warnings_list,
+        notes=[f"方法：{method_text}；squidpy 只返回 zscore/counts（无置换均值），"
+               "故 null_mean 列为空；有向计数已按无序类别对相加、z 取两方向均值。",
+               "置换保持类别大小不变、打乱空间位置，衡量「同类相邻」是否超出随机预期"],
+        data_out=[data_file("nhood_csv", csv_path, "邻域富集表")],
+    ), method_text, notes=[f"后端函数：{method_text}"])
+
+
+def run_nhood_enrichment(ctx: dict, params: dict, outdir: str) -> dict:
+    """邻域富集：squidpy.gr.nhood_enrichment，失败回退 sp_domain 内置实现。"""
+    if HAS_SQUIDPY and HAS_ANNDATA:
+        try:
+            return _run_nhood_squidpy(ctx, params, outdir)
+        except Exception as error:  # noqa: BLE001
+            payload = _delegate("sp_domain", "_analysis_nhood_enrichment", ctx, params, outdir,
+                                "回退内置实现（squidpy 调用失败）：邻域富集",
+                                f"squidpy.gr.nhood_enrichment 调用失败（{type(error).__name__}: {error}），已回退内置实现")
+            return payload
+    return _with_method(
+        _delegate("sp_domain", "_analysis_nhood_enrichment", ctx, params, outdir,
+                  "内置实现", "squidpy 不可用，使用内置实现"),
+        "回退内置实现（squidpy 不可用）：类别对邻接计数 + 标签置换 z-score")
+
+
+# ---------------------------------------------------------------------------
+# 11. co_occurrence → squidpy.gr.co_occurrence
+# ---------------------------------------------------------------------------
+
+def _run_cooccurrence_squidpy(ctx: dict, params: dict, outdir: str) -> dict:
+    params = dict(params or {})
+    view = _view(ctx, need_x=False)
+    labels, key = _cluster_labels(ctx, _p_str(params.get("cluster_key")), view["spot_idx"])
+    n_rings = int(max(1, min(_p_int(params.get("n_rings"), 5), 20)))
+    interval = params.get("interval")
+    adata = _to_adata(view, coords=view["coords"], labels=labels, label_key="clusters",
+                      n_obs=view["n"])
+    if isinstance(interval, (list, tuple)) and len(interval) == 2:
+        try:
+            lo, hi = float(interval[0]), float(interval[1])
+        except (TypeError, ValueError):
+            raise bad_request("interval 需要 [起始距离, 结束距离] 两个数字")
+        if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+            raise bad_request("interval 必须是递增的两个有限数字（hi > lo）")
+        edges = np.linspace(lo, hi, n_rings + 1)
+    else:
+        edges = int(n_rings + 1)  # squidpy 用 int = 边界个数 → n_rings 个环
+    out = _squidpy.gr.co_occurrence(adata, cluster_key="clusters", interval=edges, copy=True)
+    if out is None or not isinstance(out, tuple):
+        raise EngineError("internal", "squidpy.gr.co_occurrence 没有返回结果")
+    occ, edge_arr = out
+    occ = np.asarray(occ, dtype=float)
+    edge_arr = np.asarray(edge_arr, dtype=float)
+    if occ.ndim != 3:
+        raise EngineError("internal", f"squidpy co_occurrence 输出维度异常：{occ.shape}")
+    uniq = [str(c) for c in adata.obs["clusters"].cat.categories]
+    # squidpy 的 occ 未按锚定类别归一；这里按「锚定类别 × 环」归一为条件概率 P(b|a, ring)
+    totals_raw = occ.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        prob = np.where(totals_raw > 0, occ / np.maximum(totals_raw, 1e-12), 0.0)
+    prob = np.clip(prob, 0.0, 1.0)
+    centers = 0.5 * (edge_arr[:-1] + edge_arr[1:])
+    n_bins = int(prob.shape[2])
+    res = {"uniq": uniq, "prob": prob, "centers": centers, "n_rings": n_bins,
+           "totals": prob.sum(axis=1), "n_spots": int(view["n"])}
+    # 表：与原实现同列（n_pairs 不可得 → 置空）
+    rows = []
+    for i, a_name in enumerate(uniq):
+        for j, b_name in enumerate(uniq):
+            for r in range(n_bins):
+                rows.append({
+                    "cluster_a": str(a_name),
+                    "cluster_b": str(b_name),
+                    "ring": r + 1,
+                    "distance": round(float(centers[r]), 4) if r < len(centers) else None,
+                    "prob": round(float(prob[i, j, r]), 5),
+                    "n_pairs": None,
+                })
+    frame = pd.DataFrame(rows)
+    csv_path = export_csv(frame, outdir, "co_occurrence", index=False)
+    table_obj = table(
+        "co_occurrence", "共现概率（按距离环）",
+        [{"key": "cluster_a", "label": "锚定类别", "type": "string"},
+         {"key": "cluster_b", "label": "邻居类别", "type": "string"},
+         {"key": "ring", "label": "环", "type": "number"},
+         {"key": "distance", "label": "距离", "type": "number"},
+         {"key": "prob", "label": "条件概率", "type": "number"},
+         {"key": "n_pairs", "label": "邻居对数", "type": "number"}],
+        frame, note="P(邻居类别 | 锚定类别, 距离环)；环由 squidpy 的距离阈值确定，squidpy 不返回邻居对数故 n_pairs 为空")
+    figures: list[dict] = []
+    warnings_list: list[str] = []
+    try:
+        import sp_domain
+
+        figures.append(sp_domain._cooccurrence_figure(ctx, params, outdir, res=res))
+    except Exception as exc:  # noqa: BLE001
+        warnings_list.append(f"共现曲线绘制失败：{exc}")
+    lo = float(edge_arr[0])
+    hi = float(edge_arr[-1])
+    method_text = (f"squidpy.gr.co_occurrence(cluster_key={key!r}, interval={n_rings + 1}, "
+                   f"n_steps={len(edge_arr)})（squidpy {_pkg_version(_squidpy)}）")
+    return _with_method(result(
+        title="共现分析",
+        bullets=[
+            f"按「{key}」的 {len(uniq)} 个类别、{n_bins} 个距离环（{lo:.2f}–{hi:.2f}）统计条件共现概率",
+            f"共 {len(frame)} 条「锚定类别 × 邻居类别 × 环」记录；完整表见 co_occurrence.csv",
+        ],
+        metrics={
+            "cluster_key": key,
+            "n_rings": n_bins,
+            "distance_range": [round(lo, 4), round(hi, 4)],
+            "n_categories": int(len(uniq)),
+            "max_prob": float(np.max(prob)) if prob.size else None,
+        },
+        tables=[table_obj],
+        figures=figures,
+        warnings=warnings_list,
+        notes=[f"方法：{method_text}；squidpy 的 occ 未按锚定类别归一，本表按「锚定类别 × 环」归一为条件概率（取值 ∈[0,1]）。",
+               "环数为 squidpy 的距离阈值个数减一；概率按锚定类别的邻居总数归一化"],
+        data_out=[data_file("cooccurrence_csv", csv_path, "共现概率表")],
+    ), method_text, notes=[f"后端函数：{method_text}"])
+
+
+def run_co_occurrence(ctx: dict, params: dict, outdir: str) -> dict:
+    """共现：squidpy.gr.co_occurrence，失败回退 sp_domain 内置实现。"""
+    if HAS_SQUIDPY and HAS_ANNDATA:
+        try:
+            return _run_cooccurrence_squidpy(ctx, params, outdir)
+        except EngineError as error:
+            if error.code not in ("internal",):
+                raise
+            return _delegate("sp_domain", "_analysis_co_occurrence", ctx, params, outdir,
+                             "回退内置实现（squidpy 调用失败）：共现分析",
+                             f"squidpy.gr.co_occurrence 调用失败（{error.message}），已回退内置实现")
+        except Exception as error:  # noqa: BLE001
+            return _delegate("sp_domain", "_analysis_co_occurrence", ctx, params, outdir,
+                             "回退内置实现（squidpy 调用失败）：共现分析",
+                             f"squidpy.gr.co_occurrence 调用失败（{type(error).__name__}: {error}），已回退内置实现")
+    return _with_method(
+        _delegate("sp_domain", "_analysis_co_occurrence", ctx, params, outdir,
+                  "内置实现", "squidpy 不可用，使用内置实现"),
+        "回退内置实现（squidpy 不可用）：环形分箱条件共现概率")
+
+
+# ---------------------------------------------------------------------------
+# 12. ligrec_spatial → squidpy.gr.ligrec（OmniPath）
+# ---------------------------------------------------------------------------
+
+def _ligrec_omni_enabled() -> bool:
+    """是否尝试 squidpy.gr.ligrec + OmniPath。
+
+    默认关闭：OmniPath 首次调用要联网下载（本机实测 20s+、可能 ReadTimeout），
+    不适合作为每次分析的默认路径；显式设置 DSH_SPATIAL_OMNIPATH=1 才尝试。
+    """
+    flag = str(os.environ.get("DSH_SPATIAL_OMNIPATH", "")).strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def _run_ligrec_squidpy(ctx: dict, params: dict, outdir: str) -> dict:
+    import sp_lr
+
+    params = dict(params or {})
+    view = _view(ctx, need_x=True)
+    labels, key = _cluster_labels(ctx, _p_str(params.get("cluster_key")), view["spot_idx"])
+    n_perms = int(max(1, min(_p_int(params.get("permutations"), 100), 1000)))
+    n_neighbors = int(max(1, _p_int(params.get("n_neighbors"), 6)))
+    adata = _to_adata(view, genes=view["genes"], X=view["X"], coords=view["coords"],
+                      labels=labels, label_key="clusters")
+    _spatial_neighbors_call(adata, "knn", dict(n_neighs=int(min(n_neighbors, adata.n_obs - 1))))
+    fn = _squidpy.gr.ligrec
+    kwargs = _sq_kwargs(fn, cluster_key="clusters", n_perms=n_perms, use_raw=False, n_jobs=1,
+                        rng=DEFAULT_SEED, seed=DEFAULT_SEED, show_progress_bar=False, copy=True)
+    out = fn(adata, **kwargs)
+    if not isinstance(out, dict) or "means" not in out:
+        raise EngineError("internal", "squidpy.gr.ligrec 没有返回结果")
+    means = out["means"]
+    pvals = out["pvalues"]
+    from scipy import stats as _stats
+
+    rows = []
+    clusters = [str(c) for c in adata.obs["clusters"].cat.categories]
+    for (source, target), mean_row in means.iterrows():
+        for pair, score in mean_row.items():
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                continue
+            a_name, b_name = str(pair[0]), str(pair[1])
+            try:
+                p = float(pvals.loc[(source, target), pair])
+            except Exception:  # noqa: BLE001
+                p = float("nan")
+            if not np.isfinite(p):
+                p = 1.0
+            # 置换检验的分辨率下限：p 不会低于 1/(n_perms+1)
+            floor = 1.0 / float(n_perms + 1)
+            p = float(np.clip(max(p, floor), floor, 1.0))
+            z = float(_stats.norm.isf(p)) if p < 1.0 else 0.0
+            rows.append({
+                "ligand": str(source), "receptor": str(target), "pathway": "",
+                "cluster_a": a_name, "cluster_b": b_name,
+                "score": float(score), "z": z, "p": p, "p_adj": p,
+                "pct_ligand": None, "pct_receptor": None, "adjacency": None,
+            })
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        raise EngineError("internal", "squidpy.gr.ligrec 没有可用的配体-受体对")
+    frame = frame.sort_values(["p", "score"], ascending=[True, False]).reset_index(drop=True)
+    frame["p_adj"] = bh_fdr(frame["p"].to_numpy(dtype=float))
+    top_n = int(max(1, _p_int(params.get("top_n"), 30)))
+    figframe = frame.head(200)
+    mat = np.zeros((len(clusters), len(clusters)), dtype=float)
+    for _, row in figframe.iterrows():
+        if row["cluster_a"] in clusters and row["cluster_b"] in clusters:
+            ia = clusters.index(row["cluster_a"])
+            ib = clusters.index(row["cluster_b"])
+            mat[ia, ib] = max(mat[ia, ib], float(row["z"]))
+    fig, ax = new_fig(6.4, 5.2)
+    image = ax.imshow(mat, cmap="viridis")
+    ax.set_xticks(np.arange(len(clusters)))
+    ax.set_xticklabels(clusters, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(np.arange(len(clusters)))
+    ax.set_yticklabels(clusters, fontsize=8)
+    ax.set_xlabel("receiver cluster (receptor)", fontsize=9)
+    ax.set_ylabel("sender cluster (ligand)", fontsize=9)
+    ax.set_title("Spatial ligand-receptor communication (max z)", fontsize=10)
+    bar = fig.colorbar(image, ax=ax, fraction=0.04, pad=0.02)
+    bar.set_label("z-score (from permutation p)", fontsize=8)
+    figure = save_fig(fig, outdir, "lr-heatmap", title=None)
+    method_text = (f"squidpy.gr.ligrec(cluster_key={key!r}, n_perms={n_perms}, use_raw=False, "
+                   f"rng=0) + OmniPath 交互表（squidpy {_pkg_version(_squidpy)}）")
+    significant = int((frame["p_adj"] < 0.05).sum())
+    return _with_method(result(
+        summary={"title": "空间配体-受体", "bullets": [
+            f"{len(frame)} 条配体-受体-簇对候选通讯（squidpy + OmniPath，置换 {n_perms} 次）",
+            "最强信号：" + "、".join(
+                f"{r['ligand']}→{r['receptor']}({r['cluster_a']}→{r['cluster_b']}, p={r['p']:.3g})"
+                for _, r in frame.head(3).iterrows()),
+            f"p_adj<0.05 的候选：{significant} 条"],
+            "metrics": {"n_pairs": int(frame[["ligand", "receptor"]].drop_duplicates().shape[0]),
+                        "n_clusters": len(clusters), "n_calls": int(len(frame)),
+                        "n_significant": significant}},
+        tables=[table("ligrec", "配体-受体通讯（按 p 排序）",
+                      columns=[{"key": "ligand", "label": "配体", "type": "string"},
+                               {"key": "receptor", "label": "受体", "type": "string"},
+                               {"key": "pathway", "label": "通路", "type": "string"},
+                               {"key": "cluster_a", "label": "发送簇", "type": "string"},
+                               {"key": "cluster_b", "label": "接收簇", "type": "string"},
+                               {"key": "score", "label": "得分", "type": "number"},
+                               {"key": "z", "label": "z", "type": "number"},
+                               {"key": "p", "label": "p", "type": "number"},
+                               {"key": "p_adj", "label": "p_adj", "type": "number"},
+                               {"key": "pct_ligand", "label": "配体阳性%", "type": "number"},
+                               {"key": "pct_receptor", "label": "受体阳性%", "type": "number"},
+                               {"key": "adjacency", "label": "空间相邻度", "type": "number"}],
+                      rows=frame.head(200).to_dict(orient="records"))],
+        figures=[figure],
+        data_out=[data_file("ligrec_csv", export_csv(frame, outdir, "ligrec.csv", index=False),
+                            "配体-受体通讯表")],
+        store={"ligrec": {"frame": frame, "n_pairs": int(len(frame))}},
+        notes=[f"方法：{method_text}；z 由 squidpy 的单侧置换 p 经正态分位反解 Φ⁻¹(1-p)，"
+               f"p 下限取置换分辨率 1/(n_perms+1)={1.0 / float(n_perms + 1):.4g}；"
+               "pct_ligand/pct_receptor/adjacency 由内置 LR 库实现提供，squidpy 路径不返回这三列故留空。"],
+    ), method_text, notes=[f"后端函数：{method_text}"])
+
+
+def run_ligrec_spatial(ctx: dict, params: dict, outdir: str) -> dict:
+    """空间配体-受体：默认内置 LR 库；DSH_SPATIAL_OMNIPATH=1 时尝试 squidpy + OmniPath。"""
+    if HAS_SQUIDPY and HAS_ANNDATA and _ligrec_omni_enabled():
+        try:
+            return _run_ligrec_squidpy(ctx, params, outdir)
+        except Exception as error:  # noqa: BLE001 - 网络/接口问题一律降级
+            return _delegate(
+                "sp_lr", "analysis_ligrec", ctx, params, outdir,
+                "回退内置实现：内置 LR 库（squidpy/OmniPath 不可达）",
+                f"OmniPath 不可达（{type(error).__name__}: {error}），使用内置 LR 库")
+    return _with_method(
+        _delegate("sp_lr", "analysis_ligrec", ctx, params, outdir, "内置实现",
+                  "OmniPath 不可达（默认不联网下载）或未启用 DSH_SPATIAL_OMNIPATH=1，使用内置 LR 库"),
+        "内置 LR 库（sp_lr.analysis_ligrec）：squidpy.gr.ligrec 需联网抓 OmniPath，"
+        "本机默认不可达，故使用内置 LR 库")
+
 ANALYSES = [
+    # ---- squidpy 实现的跨模块分析（id/params/needs 与原实现一致，先注册先生效）----
+    {
+        "id": "nhood_enrichment",
+        "title": "邻域富集",
+        "group": "邻域与域",
+        "method": "squidpy.gr.nhood_enrichment（类别对邻接计数 + 标签置换 z-score；Schürch 2020）",
+        "needs": ["cluster"],
+        "params": [
+            _CLUSTER_PARAM,
+            {"key": "n_perms", "label": "置换次数", "type": "number", "default": 100},
+            {"key": "n_neighbors", "label": "空间近邻数", "type": "number", "default": 6},
+        ],
+        "run": run_nhood_enrichment,
+    },
+    {
+        "id": "co_occurrence",
+        "title": "共现分析",
+        "group": "邻域与域",
+        "method": "squidpy.gr.co_occurrence（环形分箱条件共现概率）",
+        "needs": ["cluster"],
+        "params": [
+            _CLUSTER_PARAM,
+            {"key": "n_rings", "label": "距离环数", "type": "number", "default": 5},
+            {"key": "interval", "label": "距离区间 [lo,hi]（可空）", "type": "list", "default": None},
+        ],
+        "run": run_co_occurrence,
+    },
+    {
+        "id": "ligrec_spatial", "title": "空间配体-受体", "group": "空间通讯",
+        "method": "squidpy.gr.ligrec + OmniPath 交互表（离线回退内置 LR 库）",
+        "needs": ["cluster"],
+        "params": [
+            {"key": "cluster_key", "label": "簇列", "type": "text", "default": "clusters"},
+            {"key": "n_neighbors", "label": "邻居数", "type": "number", "default": 6},
+            {"key": "min_frac", "label": "最低表达比例", "type": "number", "default": 0.1},
+            {"key": "permutations", "label": "置换次数", "type": "number", "default": 100},
+            {"key": "top_n", "label": "返回条数", "type": "number", "default": 30},
+        ],
+        "run": run_ligrec_spatial,
+    },
     {
         "id": "morans_svg",
         "title": "空间自相关（Moran's I）",
         "group": ANALYSIS_GROUP,
-        "method": "Moran's I（Moran 1950）+ 正态近似与标签置换；行标准化半径邻接权重；内置实现",
+        "method": "squidpy.gr.spatial_autocorr(mode=moran)：Moran's I（Moran 1950）+ 解析/置换 p；行标准化半径邻接（squidpy.gr.spatial_neighbors_radius）",
         "needs": ["cluster"],
         "params": _SVG_COMMON_PARAMS + [
             {"key": "permutations", "label": "置换次数", "type": "number", "default": 100, "min": 0, "max": 5000,
@@ -2482,7 +3734,7 @@ ANALYSES = [
         "id": "gearys_svg",
         "title": "空间自相关（Geary's C）",
         "group": ANALYSIS_GROUP,
-        "method": "Geary's C（Geary 1954）+ 标签置换经验 p；行标准化半径邻接权重；内置实现",
+        "method": "squidpy.gr.spatial_autocorr(mode=geary)：Geary's C（Geary 1954）+ 解析/置换 p；行标准化半径邻接（squidpy.gr.spatial_neighbors_radius）",
         "needs": ["cluster"],
         "params": _SVG_COMMON_PARAMS + [
             {"key": "permutations", "label": "置换次数", "type": "number", "default": 99, "min": 0, "max": 5000,
@@ -2494,7 +3746,7 @@ ANALYSES = [
         "id": "svg_permutation",
         "title": "空间置换检验",
         "group": ANALYSIS_GROUP,
-        "method": "标签置换经验 p=(k+1)/(n+1)（SPARK-X 思想，Sun 2021）；内置实现",
+        "method": "标签置换经验 p=(k+1)/(n+1)（SPARK-X 思想，Sun 2021）；" + BUILTIN_ONLY_REASON,
         "needs": ["cluster"],
         "params": _SVG_COMMON_PARAMS + [
             {"key": "permutations", "label": "置换次数", "type": "number", "default": 200, "min": 1, "max": 5000,
@@ -2506,7 +3758,7 @@ ANALYSES = [
         "id": "cross_moran",
         "title": "双变量空间自相关",
         "group": ANALYSIS_GROUP,
-        "method": "双变量 Moran's I（Wartenberg 1985）+ 标签置换；内置实现",
+        "method": "双变量 Moran's I（Wartenberg 1985）+ 标签置换；" + BUILTIN_ONLY_REASON,
         "needs": ["cluster"],
         "params": [
             {"key": "gene_a", "label": "基因 A", "type": "string", "default": ""},
@@ -2521,7 +3773,7 @@ ANALYSES = [
         "id": "hotspot",
         "title": "热点检测（Getis-Ord Gi*）",
         "group": ANALYSIS_GROUP,
-        "method": "Getis-Ord Gi*（Getis & Ord 1992）；kNN 邻域二值权重（含自身）；内置实现",
+        "method": "Getis-Ord Gi*（Getis & Ord 1992）；kNN 邻域二值权重（含自身）；" + BUILTIN_ONLY_REASON,
         "needs": ["cluster"],
         "params": _HOTSPOT_PARAMS,
         "run": run_hotspot,
@@ -2530,7 +3782,7 @@ ANALYSES = [
         "id": "spatial_gradient",
         "title": "空间梯度",
         "group": ANALYSIS_GROUP,
-        "method": "沿轴投影等频分箱 + 均值±SE + 线性趋势检验（内置实现；组织梯度常用做法）",
+        "method": "沿轴投影等频分箱 + 均值±SE + 线性趋势检验；" + BUILTIN_ONLY_REASON + "（空间转录组组织梯度常用做法）",
         "needs": ["cluster"],
         "params": _GRADIENT_PARAMS,
         "run": run_spatial_gradient,
@@ -2539,7 +3791,7 @@ ANALYSES = [
         "id": "spatial_corr_pairs",
         "title": "空间共表达基因对",
         "group": ANALYSIS_GROUP,
-        "method": "Pearson 相关 + 邻域乘积一致性（内置实现；行标准化半径邻接）",
+        "method": "Pearson 相关 + 邻域乘积一致性（行标准化半径邻接）；" + BUILTIN_ONLY_REASON,
         "needs": ["cluster"],
         "params": [
             {"key": "genes", "label": "指定基因", "type": "string", "default": "",
@@ -2555,7 +3807,7 @@ ANALYSES = [
         "id": "ripley_k",
         "title": "Ripley's K/L 函数",
         "group": ANALYSIS_GROUP,
-        "method": "Ripley's K/L（Ripley 1977）+ 完全空间随机(CSR) 随机点包络；内置实现",
+        "method": "squidpy.gr.ripley(mode=L, n_simulations=...)：Ripley's K/L（Ripley 1977）+ CSR 模拟包络；K=πL² 由 L 反解",
         "needs": ["cluster"],
         "params": [
             {"key": "cluster_key", "label": "聚类列", "type": "string", "default": "clusters"},
@@ -2568,7 +3820,7 @@ ANALYSES = [
         "id": "gene_autocorr_scan",
         "title": "全基因空间自相关扫描",
         "group": ANALYSIS_GROUP,
-        "method": "全基因向量化 Moran's I（稀疏矩阵乘法）+ 正态近似 + BH FDR；内置实现",
+        "method": "全基因向量化 Moran's I（稀疏矩阵乘法）+ 正态近似 + BH FDR；" + BUILTIN_ONLY_REASON + "（保留全基因 expected/z/FDR 列，spatial_autocorr 不导出这些列）",
         "needs": ["normalize"],
         "params": [
             {"key": "max_genes", "label": "最多扫描基因数", "type": "number", "default": 2000,

@@ -48,8 +48,33 @@ python3 -c "import numpy,pandas,scipy,sklearn,matplotlib,h5py,anndata,PIL,certif
 
 ## 说明与边界
 
-- 空间统计、MRF 域、反卷积、配体-受体全部是**内置实现**（numpy/scipy/sklearn），依据写在每个分析的「方法」列里（Moran 1950；Geary 1954；Getis & Ord 1992；Ripley 1977；BayesSpace 2021 思想；Tsoucas 2019 DWLS；CellPhoneDB 2020 / CellChat 2021 思路）。本机没有 scanpy/squidpy/umap-learn，所以不冒充官方包。
-- 聚类用 networkx Louvain（Blondel 2008），嵌入用 sklearn t-SNE；t-SNE 对 >20000 spot 自动下采样。
-- 反卷积是"平均表达谱 + NNLS"级别的近似，**不是** cell2location/RCTD 的贝叶斯模型；结论请结合标记基因验证。
-- GEO 检索依赖 NCBI 可达；失败会给中文原因（重试 ≤2 次）。
-- 图内文字为英文（避免缺 CJK 字体），中文说明在结果摘要里。
+**计算实现（2026-11 更新：已装真包，默认走主流实现）**
+
+专用环境 `~/.dsh/runtimes/bio312`（Python 3.12，用 uv 建）：`scanpy 1.12.6`、`squidpy 1.8.4`、`anndata 0.13.4`、`leidenalg 0.12`、`igraph 1.0`、`umap-learn`、`scikit-misc`、`harmonypy`。
+引擎会自动优先这个解释器；每个步骤/分析的 `method` 字段写的是**真实调用**，例如：
+
+- `qc` → `scanpy.pp.calculate_qc_metrics(qc_vars=[mt])`
+- `normalize` → `scanpy.pp.normalize_total` + `scanpy.pp.log1p`
+- `hvg` → `scanpy.pp.highly_variable_genes(flavor=seurat_v3)`
+- `pca` → `scanpy.pp.scale` + `scanpy.tl.pca`
+- `neighbors` → `scanpy.pp.neighbors` + `squidpy.gr.spatial_neighbors`
+- `cluster` → `scanpy.tl.leiden(flavor="igraph")`
+- `embed` → `scanpy.tl.tsne` / `scanpy.tl.umap`
+- `morans_svg` / `gearys_svg` → `squidpy.gr.spatial_autocorr(mode="moran"/"geary")`
+- `nhood_enrichment` → `squidpy.gr.nhood_enrichment`；`co_occurrence` → `squidpy.gr.co_occurrence`；`ripley_k` → `squidpy.gr.ripley`
+- `ligrec_spatial` → `squidpy.gr.ligrec`（OmniPath；不可达时用内置 LR 库并注明）
+
+**仍不是主流包的地方（squidpy 没有对应 API，已在 method 写明"内置实现"）**：
+Getis-Ord Gi* 热点、沿轴空间梯度、双基因空间共表达对、双变量 Moran、全基因扫描的独立置换表、空间离群点/切片对齐诊断/空间轨迹；
+空间域用 MRF 平滑（BayesSpace/GraphST 思想，R/TF 实现未装）、反卷积在 RCTD 不可用时用 NNLS/DWLS（Tsoucas 2019 语义）。
+**scanpy/squidpy 不在时**（宿主自带 python3）会自动回退到等价内置实现，method 会标"回退内置实现"。
+
+**GEO 检索行为（2026-11 修订）**
+- 选「空间平台」（Visium/Stereo-seq/Slide-seq/Xenium/MERFISH/全部）时，平台词会**并入检索式**（如 `胃癌 AND (Visium OR "spatial transcriptomics")`），从源头只回该平台记录；事后过滤也是**严格的**——不命中就返回空并提示，不再回退成一堆无关数据。
+- 不选平台时按**空间相关度排序**（high → mid → low），非空间记录仍在但排后面；`共 N 条` 显示的是过滤后的数量。
+- NCBI 限流时（HTTP 403/429）会给可读提示并重试；如需高频检索，设置环境变量 `DSH_NCBI_API_KEY`（免费申请）可把配额提到 10 次/秒，`DSH_NCBI_EMAIL` 可选。
+
+其它：
+- 反卷积需要单细胞参考（h5ad，带细胞类型列；RCTD 需要 counts）。
+- GEO 检索依赖 NCBI 可达；失败给中文原因（重试 ≤2 次）。
+- 图内文字用英文 + 中文回落字体（Helvetica/PingFang SC）。

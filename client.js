@@ -247,7 +247,7 @@
         { key: 'ref', label: '参考 h5ad 路径', type: 'text', default: '', placeholder: '/absolute/path/ref.h5ad' },
         {
           key: 'method', label: '方法', type: 'select', default: 'nnls',
-          options: [{ value: 'nnls', label: 'NNLS' }, { value: 'dwls', label: 'DWLS' }],
+          options: [{ value: 'nnls', label: 'NNLS（内置）' }, { value: 'dwls', label: 'DWLS（内置）' }, { value: 'rctd', label: 'RCTD（spacexr，需 R）' }],
         },
         { key: 'cell_type_col', label: '细胞类型列', type: 'text', default: '', placeholder: 'cell_type' },
         { key: 'min_genes', label: '最少共享基因', type: 'number', default: 50, min: 10, step: 10 },
@@ -4941,7 +4941,7 @@
       function runSearch(event) {
         if (event && event.preventDefault) event.preventDefault()
         if (!plainText(filters.term)) return
-        setSearch({ busy: true, error: '', total: 0, items: [] })
+        setSearch({ busy: true, error: '', notes: [], total: 0, items: [] })
         setDetail({ gse: '', busy: false, error: '', detail: null })
         props.api.geoSearch(filters)
           .then(function (response) {
@@ -4949,11 +4949,12 @@
             setSearch({
               busy: false,
               error: '',
+              notes: normalizeStringList(response && response.notes),
               total: asNumber(response && response.total) === null ? items.length : asNumber(response.total),
               items: items,
             })
           })
-          .catch(function (error) { setSearch({ busy: false, error: formatError(error), total: 0, items: [] }) })
+          .catch(function (error) { setSearch({ busy: false, error: formatError(error), notes: [], total: 0, items: [] }) })
       }
       function openDetail(item) {
         setDetail({ gse: item.gse, busy: true, error: '', detail: null })
@@ -5141,6 +5142,10 @@
               h('span', null, T('geoHasMatrix')))),
           h('div', { className: 'sp-muted' }, T('geoHint')),
           search.error ? h(InlineError, { message: T('geoErrorSearch') + '：' + search.error }) : null,
+          (search.notes && search.notes.length)
+            ? h('div', { className: 'sp-muted', style: { marginTop: '6px' } },
+                search.notes.map(function (note, index) { return h('div', { key: 'gn' + index }, '· ' + note) }))
+            : null,
           search.busy
             ? h(LoadingLine, { text: T('geoSearching') })
             : h('div', { className: 'sp-geo-layout' },

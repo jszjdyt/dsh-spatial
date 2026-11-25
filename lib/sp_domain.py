@@ -347,14 +347,39 @@ def _group_values(ctx, n: int, group_col: str = "") -> tuple[list[str] | None, s
 # 空间邻接 / 邻居
 # ---------------------------------------------------------------------------
 
-def _knn(coords: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-    """按坐标的 k 近邻（不含自身），返回 (indices[n,k], distances[n,k])。用 KD-tree 控制内存。"""
+def _blocks(ctx) -> tuple[list[np.ndarray], list[str], str | None, list[str]]:
+    """物理块（切片/样本）标签：``(blocks, names, key, warnings)``。
+
+    ``sp_common.spatial_blocks`` 优先取 slide/library/slice/sample/specimen/patient 列；
+    没有这类列时返回单个全量块（单切片数据，行为与旧版一致）。
+    """
+    return sc.spatial_blocks(ctx)
+
+
+def _blocked(ctx) -> bool:
+    """是否多切片/多样本（物理块 > 1）。"""
+    try:
+        blocks, _names, _key, _warns = _blocks(ctx)
+    except Exception:  # noqa: BLE001
+        return False
+    return len(blocks) > 1
+
+
+def _knn(coords: np.ndarray, k: int, blocks=None) -> tuple[np.ndarray, np.ndarray]:
+    """按坐标的 k 近邻（不含自身），返回 (indices[n,k], distances[n,k])。用 KD-tree 控制内存。
+
+    多切片（``blocks`` > 1）时邻居只在块内取（``sp_common.blocked_coord_knn``），
+    绝不把「不同切片的相似坐标」当邻居。
+    """
     from scipy.spatial import cKDTree
 
     arr = np.asarray(coords, dtype=float)
     n = arr.shape[0]
     if n < 2:
         return np.zeros((n, 0), dtype=int), np.zeros((n, 0))
+    if blocks is not None and len(blocks) > 1:
+        idx, dist, _k_eff = sc.blocked_coord_knn(arr, blocks, int(k))
+        return np.asarray(idx, dtype=int), np.asarray(dist, dtype=float)
     k = int(max(1, min(int(k), n - 1)))
     tree = cKDTree(arr)
     dist, idx = tree.query(arr, k=k + 1)
@@ -382,23 +407,31 @@ def _sparse_row_norm(idx: np.ndarray, n: int, data=None):
     return sparse.diags(1.0 / row_sum) @ mat
 
 
-def _spatial_graph(ctx, k: int = 6):
-    """空间平滑用的行标准化稀疏邻接矩阵（对称 kNN）。"""
+def _spatial_graph(ctx, k: int = 6, blocks=None):
+    """空间平滑用的行标准化稀疏邻接矩阵（对称 kNN，多切片时块内取邻居）。"""
     coords = _coords(ctx)
-    idx, _ = _knn(coords, k)
+    if blocks is None:
+        blocks = _blocks(ctx)[0]
+    idx, _ = _knn(coords, k, blocks=blocks)
     return _sparse_row_norm(idx, coords.shape[0])
 
 
 def _radius_weights(ctx):
     """Moran's I / Geary's C 用的行标准化空间权重。
 
-    n ≤ 12000 时用 sp_common.spatial_weights（半径图，与 import 估计的 neighbor_radius 一致）；
+    多切片（物理块 > 1）：按切片分块建边（``sp_common.blocked_spatial_weights``），半径按块估计
+    （``blocked_radius_estimate``）—— 合并坐标里「同坐标不同切片」会把最近邻距离带偏成 0/fallback。
+    单块：n ≤ 12000 时用 sp_common.spatial_weights（半径图，与 import 估计的 neighbor_radius 一致）；
     更大规模用 KD-tree 半径查询构造等价稀疏矩阵，避免 n×n 稠密距离矩阵爆内存。
     """
     from scipy import sparse
 
     coords = _coords(ctx)
     n = coords.shape[0]
+    blocks, _names, _key, _warns = _blocks(ctx)
+    if len(blocks) > 1:
+        radius = float(sc.blocked_radius_estimate(coords, blocks))
+        return sc.blocked_spatial_weights(coords, blocks, radius)
     radius = ctx.get("neighbor_radius")
     try:
         radius = float(radius) if radius is not None else 0.0
@@ -460,8 +493,12 @@ def _moran_geary_block(block: np.ndarray, W, method: str, row_sum: np.ndarray):
     return stat
 
 
-def _svg_scores(X: np.ndarray, W, method: str, chunk: int = 256) -> tuple[np.ndarray, np.ndarray, dict]:
-    """全基因 Moran's I / Geary's C 与正态近似的 z 值。"""
+def _svg_scores(X: np.ndarray, W, method: str, chunk: int = 256,
+                blocks=None) -> tuple[np.ndarray, np.ndarray, dict]:
+    """全基因 Moran's I / Geary's C 与正态近似的 z 值。
+
+    多切片：每个基因先做块内中心化再做空间自相关（去掉切片间均值差，避免伪信号）。
+    """
     n, m = X.shape
     s0, s1, s2 = _weight_moments(W)
     row_sum = np.asarray(W.sum(axis=1)).ravel()
@@ -482,8 +519,11 @@ def _svg_scores(X: np.ndarray, W, method: str, chunk: int = 256) -> tuple[np.nda
     for start in range(0, m, chunk):
         stop = min(m, start + chunk)
         block = np.asarray(X[:, start:stop], dtype=np.float64)
-        mean = block.mean(axis=0, keepdims=True)
-        block = block - mean
+        if blocks is not None and len(blocks) > 1:
+            block = sc.center_within_blocks(block, blocks)
+        else:
+            mean = block.mean(axis=0, keepdims=True)
+            block = block - mean
         stat = _moran_geary_block(block, W, method, row_sum)
         stats[start:stop] = stat * scale
     if np.isfinite(moments["var"]) and moments["var"] > 0:
@@ -504,31 +544,47 @@ def _normal_p(zvals: np.ndarray) -> np.ndarray:
     return np.clip(p, 0.0, 1.0)
 
 
-def _permutation_p(X, W, gene_idx: np.ndarray, method: str, permutations: int, rng) -> np.ndarray:
-    """标签置换（打乱 spot 顺序）经验 p 值（Moran 单侧 greater；Geary 单侧 less）。"""
+def _permutation_p(X, W, gene_idx: np.ndarray, method: str, permutations: int, rng,
+                   blocks=None) -> np.ndarray:
+    """标签置换经验 p 值（Moran 单侧 greater；Geary 单侧 less）。
+
+    多切片：只在块内打乱标签（``sp_common.within_block_permutation``），零分布不交换切片；
+    并把观测/置换值都做块内中心化。
+    """
     n = X.shape[0]
     idx = np.asarray(gene_idx, dtype=int)
     if idx.size == 0 or permutations <= 0:
         return np.full(idx.size, np.nan)
     permutations = int(max(1, min(permutations, 2000)))
+    multi = blocks is not None and len(blocks) > 1
     block0 = np.asarray(X[:, idx], dtype=np.float64)
-    block0 = block0 - block0.mean(axis=0, keepdims=True)
+    if multi:
+        block0 = sc.center_within_blocks(block0, blocks)
+    else:
+        block0 = block0 - block0.mean(axis=0, keepdims=True)
     s0, _, _ = _weight_moments(W)
     row_sum = np.asarray(W.sum(axis=1)).ravel()
     scale = (n - 1) / (2.0 * s0) if method == "geary" and s0 > 0 else 1.0
-    small = block0.shape[1] <= 400
     observed = _moran_geary_block(block0, W, method, row_sum) * scale
     hits = np.zeros(idx.size)
+    valid_perms = np.zeros(idx.size)
     for _ in range(permutations):
-        perm = rng.permutation(n)
+        if multi:
+            perm = sc.within_block_permutation(blocks, n, rng)
+        else:
+            perm = rng.permutation(n)
         block = block0[perm]
         # 打乱后仍用同一空间权重；行和需与打乱后的矩阵一致（对称图不变）
         stat = _moran_geary_block(block, W, method, row_sum) * scale
+        finite = np.isfinite(stat) & np.isfinite(observed)
+        valid_perms += np.isfinite(stat).astype(float)
         if method == "moran":
-            hits += (stat >= observed).astype(float)
+            hits += np.where(finite, stat >= observed, False).astype(float)
         else:
-            hits += (stat <= observed).astype(float)
-    p = (1.0 + hits) / (1.0 + permutations)
+            hits += np.where(finite, stat <= observed, False).astype(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        p = np.where(valid_perms > 0, (1.0 + hits) / (1.0 + valid_perms), np.nan)
+    p = np.where(np.isfinite(observed), p, np.nan)
     return np.clip(p, 0.0, 1.0)
 
 
@@ -553,9 +609,15 @@ def _svg_table(ctx, params, outdir) -> dict:
         # 空间自相关仍可用全量；这里只提示内存
         warnings.append(f"spot 数较多（{n_spots}），Moran's I 逐基因块计算以控制内存")
 
+    blocks, block_names, block_key, block_warns = _blocks(ctx)
+    if len(blocks) > 1:
+        warnings.append(
+            f"多切片（{len(blocks)} 个，列「{block_key}」）：Moran/Geary 先做切片内中心化，"
+            "置换只在切片内进行；解析正态近似只作参考")
+    warnings.extend(block_warns)
     W = _radius_weights(ctx)
     Xd = X.astype(np.float32, copy=False)
-    stats, zvals, moments = _svg_scores(Xd, W, method)
+    stats, zvals, moments = _svg_scores(Xd, W, method, blocks=blocks)
     pvals = _normal_p(zvals)
     p_adj = sc.bh_fdr(pvals)
 
@@ -592,7 +654,7 @@ def _svg_table(ctx, params, outdir) -> dict:
         cand_n = int(min(len(frame), max(n_top * 3, 100), 400))
         cand_genes = frame["gene"].head(cand_n).tolist()
         cand_idx = np.array([genes.index(g) for g in cand_genes if g in genes], dtype=int)
-        p_perm = _permutation_p(Xd, W, cand_idx, method, permutations, _rng(ctx))
+        p_perm = _permutation_p(Xd, W, cand_idx, method, permutations, _rng(ctx), blocks=blocks)
         pos = frame.index[frame["gene"].isin([genes[i] for i in cand_idx])].to_numpy()
         frame.loc[pos, "p_value"] = p_perm[: len(pos)]
         frame["p_adj"] = sc.bh_fdr(frame["p_value"].to_numpy())
@@ -685,12 +747,16 @@ def _scale_features(feat: np.ndarray) -> np.ndarray:
 
 
 def _fused_graph(ctx, feat: np.ndarray, n_neighbors: int = 10):
-    """表达 kNN 图与空间 kNN 图的融合（相加后行标准化）。"""
+    """表达 kNN 图与空间 kNN 图的融合（相加后行标准化）。
+
+    物理空间 kNN 在切片/样本块内取邻居（表达 kNN 允许跨块：表达相似就是相似）。
+    """
     from scipy import sparse
 
     coords = _coords(ctx)
     n = coords.shape[0]
-    sp_idx, _ = _knn(coords, 6)
+    blocks, _names, _key, _warns = _blocks(ctx)
+    sp_idx, _ = _knn(coords, 6, blocks=blocks)
     g_sp = _sparse_row_norm(sp_idx, n)
     k = int(max(2, min(n_neighbors, n - 1)))
     if feat.shape[1] >= 2:
@@ -1049,6 +1115,20 @@ def run_svg(ctx, params=None, outdir=None) -> dict:
     """步骤 ``svg``：空间高变基因（Moran's I / Geary's C，内置实现）。"""
     params = dict(params or {})
     outdir = _outdir(ctx, outdir)
+    # 优先走 sp_spatial 的 squidpy 实现（squidpy.gr.spatial_autocorr）；不可用时回退内置。
+    try:
+        import sp_spatial  # 延迟导入，避免模块级循环依赖
+
+        mode = str(params.get("method") or "moran").lower()
+        runner = sp_spatial.run_gearys_svg if mode.startswith("geary") else sp_spatial.run_morans_svg
+        payload = runner(ctx, params, outdir)
+        summary = payload.get("summary") or {}
+        if summary.get("method") and "内置实现" not in str(summary.get("method")):
+            summary["title"] = "空间高变基因"
+            payload["summary"] = summary
+            return payload
+    except Exception:  # noqa: BLE001 - 委托失败就回退内置
+        pass
     computed = _svg_table(ctx, params, outdir)
     frame = computed["frame"]
     top = computed["top"]
@@ -1128,7 +1208,11 @@ def _svg_note(method: str) -> str:
 
 
 def _radius_text(ctx) -> str:
+    """邻接半径的文字说明（多切片时按块估计，与合并坐标估计可能不同）。"""
+    blocks, _names, _key, _warns = _blocks(ctx)
     try:
+        if len(blocks) > 1:
+            return f"按 {len(blocks)} 个切片分块估计 {sc.blocked_radius_estimate(_coords(ctx), blocks):.1f}"
         radius = float(ctx.get("neighbor_radius") or 0.0)
     except (TypeError, ValueError):
         radius = 0.0
@@ -1141,6 +1225,8 @@ def run_domains(ctx, params=None, outdir=None) -> dict:
     outdir = _outdir(ctx, outdir)
     computed = compute_domains(ctx, params, outdir, write_back=True)
     labels = computed["labels"]
+    _method_text = ("MRF 空间域（BayesSpace 2021 思想：PCA + 空间邻接图 + 马尔可夫随机场迭代；"
+                    "内置实现，squidpy 无空间域 API）")
     X, genes, spots = _matrix(ctx)
     labels_num = np.asarray(labels, dtype=object)
     uniq = list(dict.fromkeys([str(v) for v in labels]))
@@ -1195,9 +1281,14 @@ def run_domains(ctx, params=None, outdir=None) -> dict:
         "（BayesSpace 2021 思想；内置实现，不调用 BayesSpace/squidpy）",
         "域编号按大小降序重排，便于跨切片比较；结果写回 spot 级列 domains",
     ]
+    try:
+        summary_obj = {"title": "空间域", "bullets": bullets, "method": _method_text}
+    except NameError:  # pragma: no cover - 防御
+        summary_obj = None
     out = sc.result(
-        title="空间域",
-        bullets=bullets,
+        summary=summary_obj or None,
+        title="空间域" if summary_obj is None else None,
+        bullets=None if summary_obj is not None else bullets,
         metrics=metrics,
         tables=[table_obj],
         figures=figures,
@@ -1246,14 +1337,18 @@ def _cluster_pairs(labels: np.ndarray, k_cat: int) -> np.ndarray:
     return labels
 
 
-def _nhood_enrichment_core(labels: list[str], coords: np.ndarray, n_perms: int, n_neighbors: int, rng):
-    """邻域富集：邻接计数 + 置换 z-score（squidpy nhood_enrichment 思想，内置实现）。"""
+def _nhood_enrichment_core(labels: list[str], coords: np.ndarray, n_perms: int, n_neighbors: int, rng,
+                           blocks=None):
+    """邻域富集：邻接计数 + 置换 z-score（squidpy nhood_enrichment 思想，内置实现）。
+
+    多切片时邻居只在切片内取、标签置换也限制在切片内（不跨片交换），否则邻域计数被切片结构污染。
+    """
     labels_arr = np.asarray([str(v) for v in labels], dtype=object)
     uniq = list(dict.fromkeys(labels_arr.tolist()))
     index = {name: i for i, name in enumerate(uniq)}
     codes = np.array([index[v] for v in labels_arr], dtype=int)
     k_cat = len(uniq)
-    idx, _ = _knn(coords, n_neighbors)
+    idx, _ = _knn(coords, n_neighbors, blocks=blocks)
     n = coords.shape[0]
 
     def _counts(code_vec: np.ndarray) -> np.ndarray:
@@ -1313,6 +1408,7 @@ def _nhood_figure(ctx, params, outdir, *, res: dict | None = None) -> dict:
             n_perms=_p_int((params or {}).get("n_perms"), 50),
             n_neighbors=_p_int((params or {}).get("n_neighbors"), 6),
             rng=_rng(ctx),
+            blocks=_blocks(ctx)[0],
         )
     uniq = [str(u) for u in res["uniq"]]
     z = np.clip(res["z"], -8.0, 8.0)
@@ -1343,7 +1439,8 @@ def _nhood_figure(ctx, params, outdir, *, res: dict | None = None) -> dict:
     return _fig_save(fig, ctx, params or {}, outdir, "nhood_enrich", "Neighbourhood enrichment")
 
 
-def _co_occurrence_core(labels: list[str], coords: np.ndarray, n_rings: int, interval=None) -> dict:
+def _co_occurrence_core(labels: list[str], coords: np.ndarray, n_rings: int, interval=None,
+                        blocks=None) -> dict:
     """环形分箱条件共现概率 P(label_b | label_a at ring r)（squidpy co_occurrence 思想，内置实现）。"""
     labels_arr = np.asarray([str(v) for v in labels], dtype=object)
     uniq = list(dict.fromkeys(labels_arr.tolist()))
@@ -1356,7 +1453,7 @@ def _co_occurrence_core(labels: list[str], coords: np.ndarray, n_rings: int, int
     k = int(min(n - 1, max(12, n_rings * 6)))
     if k < 2:
         raise sc.prerequisite("spot 数太少，无法计算共现（至少需要 3 个 spot）")
-    idx, dist = _knn(coords, k)
+    idx, dist = _knn(coords, k, blocks=blocks)
     dmin = float(np.min(dist)) if dist.size else 0.0
     if interval is not None:
         try:
@@ -1433,6 +1530,7 @@ def _cooccurrence_figure(ctx, params, outdir, *, res: dict | None = None) -> dic
             _coords(ctx),
             n_rings=_p_int((params or {}).get("n_rings"), 5),
             interval=interval if interval not in (None, "", []) else None,
+            blocks=_blocks(ctx)[0],
         )
     uniq = [str(u) for u in res["uniq"]]
     if len(uniq) > 6:
@@ -1488,13 +1586,13 @@ def _composition_table(labels: list[str], clusters: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _neighborhood_composition(labels: list[str], coords: np.ndarray, k: int):
+def _neighborhood_composition(labels: list[str], coords: np.ndarray, k: int, blocks=None):
     """每个 spot 的邻域类别组成向量。"""
     labels_arr = np.asarray([str(v) for v in labels], dtype=object)
     uniq = list(dict.fromkeys(labels_arr.tolist()))
     index = {name: i for i, name in enumerate(uniq)}
     codes = np.array([index[v] for v in labels_arr], dtype=int)
-    idx, _ = _knn(coords, k)
+    idx, _ = _knn(coords, k, blocks=blocks)
     k_eff = idx.shape[1]
     onehot = np.zeros((len(labels_arr), len(uniq)))
     onehot[np.arange(len(labels_arr)), codes] = 1.0
@@ -1502,8 +1600,8 @@ def _neighborhood_composition(labels: list[str], coords: np.ndarray, k: int):
     return comp, uniq
 
 
-def _diversity_core(labels: list[str], coords: np.ndarray, k: int) -> dict:
-    comp, uniq = _neighborhood_composition(labels, coords, k)
+def _diversity_core(labels: list[str], coords: np.ndarray, k: int, blocks=None) -> dict:
+    comp, uniq = _neighborhood_composition(labels, coords, k, blocks=blocks)
     p = np.clip(comp, 0.0, 1.0)
     with np.errstate(divide="ignore", invalid="ignore"):
         shannon = -np.sum(np.where(p > 0, p * np.log(np.maximum(p, 1e-12)), 0.0), axis=1)
@@ -1515,7 +1613,7 @@ def _diversity_core(labels: list[str], coords: np.ndarray, k: int) -> dict:
         "shannon": shannon,
         "simpson": simpson,
         "labels": labels_arr,
-        "k": int(_knn(coords, k)[0].shape[1]),
+        "k": int(_knn(coords, k, blocks=blocks)[0].shape[1]),
     }
 
 
@@ -1530,7 +1628,8 @@ def _boundary_core(ctx, params) -> dict:
         raise sc.bad_request("domain_a 与 domain_b 不能相同")
     n_rings = int(max(1, min(_p_int((params or {}).get("n_rings"), 3), 10)))
     labels_arr = np.asarray(labels, dtype=object)
-    idx, dist = _knn(coords, _p_int((params or {}).get("n_neighbors"), 6))
+    blocks = _blocks(ctx)[0]
+    idx, dist = _knn(coords, _p_int((params or {}).get("n_neighbors"), 6), blocks=blocks)
     mask_a = labels_arr == da
     mask_b = labels_arr == db
     if mask_a.sum() < 3 or mask_b.sum() < 3:
@@ -1696,7 +1795,8 @@ def _analysis_nhood_enrichment(ctx, params=None, outdir=None):
     coords = _coords(ctx)
     n_perms = int(max(1, min(_p_int(params.get("n_perms"), 100), 1000)))
     n_neighbors = int(max(1, _p_int(params.get("n_neighbors"), 6)))
-    res = _nhood_enrichment_core(labels, coords, n_perms, n_neighbors, _rng(ctx))
+    res = _nhood_enrichment_core(labels, coords, n_perms, n_neighbors, _rng(ctx),
+                                 blocks=_blocks(ctx)[0])
     frame = _nhood_table(res)
     csv_path = sc.export_csv(frame, outdir, "nhood_enrichment", index=False)
     table_obj = sc.table(
@@ -1754,6 +1854,7 @@ def _analysis_co_occurrence(ctx, params=None, outdir=None):
     res = _co_occurrence_core(
         labels, _coords(ctx), n_rings=n_rings,
         interval=interval if interval not in (None, "", []) else None,
+        blocks=_blocks(ctx)[0],
     )
     frame = _cooccurrence_table(res)
     csv_path = sc.export_csv(frame, outdir, "co_occurrence", index=False)
@@ -2148,7 +2249,7 @@ def _analysis_niche_cluster(ctx, params=None, outdir=None):
     coords = _coords(ctx)
     k = int(max(2, min(_p_int(params.get("k"), 8), 30)))
     n_niches = int(max(2, min(_p_int(params.get("n_niches"), 5), 20)))
-    comp, uniq = _neighborhood_composition(labels, coords, k)
+    comp, uniq = _neighborhood_composition(labels, coords, k, blocks=_blocks(ctx)[0])
     if len(uniq) < 2:
         raise sc.prerequisite(f"聚类类别只有 {len(uniq)} 个，无法构建邻域组成向量（至少需要 2 类）")
     n_niches = min(n_niches, max(2, comp.shape[0] // 10))
@@ -2243,7 +2344,7 @@ def _analysis_tissue_diversity(ctx, params=None, outdir=None):
     labels, key = _cluster_labels(ctx, _p_str(params.get("cluster_key")))
     coords = _coords(ctx)
     k = int(max(2, min(_p_int(params.get("k"), 6), 30)))
-    res = _diversity_core(labels, coords, k)
+    res = _diversity_core(labels, coords, k, blocks=_blocks(ctx)[0])
     shannon = res["shannon"]
     simpson = res["simpson"]
     labels_arr = res["labels"]
@@ -2320,16 +2421,18 @@ def _analysis_tissue_diversity(ctx, params=None, outdir=None):
 # ---------------------------------------------------------------------------
 
 def _de_result(ctx, params, outdir, *, frame, title, case_label, ctrl_label, extra_figures=None,
-               warnings=None, fig_name="de_volcano") -> dict:
+               warnings=None, fig_name="de_volcano", metrics_extra=None, bullet_head=None,
+               notes_extra=None, table_note=None, notes_base=None) -> dict:
     top_n = int(max(1, min(_p_int(params.get("top_n"), 200), 2000)))
     head = _de_head(frame, top_n)
     csv_path = sc.export_csv(frame, outdir, f"{fig_name}_all", index=False)
+    note = table_note or f"{case_label} vs {ctrl_label}；Wilcoxon 秩和 + BH FDR"
     table_obj = sc.table(
         fig_name,
         f"{title}（前 {min(top_n, len(head))} 行）",
         _de_columns(),
         head,
-        note=f"{case_label} vs {ctrl_label}；Wilcoxon 秩和 + BH FDR；完整表见 {fig_name}_all.csv",
+        note=f"{note}；完整表见 {fig_name}_all.csv",
     )
     figures: list[dict] = list(extra_figures or [])
     warns = list(warnings or [])
@@ -2342,30 +2445,38 @@ def _de_result(ctx, params, outdir, *, frame, title, case_label, ctrl_label, ext
     n_down = int(((frame["p_adj"] <= 0.05) & (frame["logFC"] < 0)).sum())
     n_sig = n_up + n_down
     bullets = [
-        f"{case_label} vs {ctrl_label}（Wilcoxon + BH）：显著 {n_sig} / {len(frame)} 个基因（上调 {n_up} / 下调 {n_down}）",
+        bullet_head or (
+            f"{case_label} vs {ctrl_label}（Wilcoxon + BH）：显著 {n_sig} / {len(frame)} 个基因"
+            f"（上调 {n_up} / 下调 {n_down}）"),
         "最显著基因：" + "、".join(
             f"{row['gene']}({row['logFC']:+.2f})" for _, row in head.head(5).iterrows()
         ),
     ]
+    metrics = {
+        "case": case_label,
+        "control": ctrl_label,
+        "n_genes": int(len(frame)),
+        "n_sig": n_sig,
+        "n_up": n_up,
+        "n_down": n_down,
+        "top_n": top_n,
+    }
+    metrics.update(metrics_extra or {})
+    if notes_base is not None:
+        notes = list(notes_base) + list(notes_extra or [])
+    else:
+        notes = [
+            "方法：Wilcoxon 秩和检验（scipy mannwhitneyu，双侧）+ BH FDR；logFC = 两组均值差（内置实现）",
+            "pct_case / pct_ctrl 为表达 >0 的 spot 百分比",
+        ] + list(notes_extra or [])
     return sc.result(
         title=title,
         bullets=bullets,
-        metrics={
-            "case": case_label,
-            "control": ctrl_label,
-            "n_genes": int(len(frame)),
-            "n_sig": n_sig,
-            "n_up": n_up,
-            "n_down": n_down,
-            "top_n": top_n,
-        },
+        metrics=metrics,
         tables=[table_obj],
         figures=figures,
         warnings=warns,
-        notes=[
-            "方法：Wilcoxon 秩和检验（scipy mannwhitneyu，双侧）+ BH FDR；logFC = 两组均值差（内置实现）",
-            "pct_case / pct_ctrl 为表达 >0 的 spot 百分比",
-        ],
+        notes=notes,
         data_out=[sc.data_file(f"{fig_name}_csv", csv_path, "差异全表")],
     )
 
@@ -2413,7 +2524,170 @@ def _analysis_de_regions(ctx, params=None, outdir=None):
     )
 
 
+#: 区域列候选（de_groups 的「供体/切片 × 区域」单位里，区域优先用空间域，其次聚类）
+_REGION_COLUMNS = ("domains", "domain", "spatial_domain", "domain_id", "region",
+                   "clusters", "cluster")
+
+
+def _region_labels(ctx, n: int, preferred: str = ""):
+    """区域标签（domains 优先，其次 clusters）：返回 (labels|None, 命中的列名)。"""
+    frame = ctx.get("sample_info")
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return None, ""
+    for cand in ([preferred] if preferred else []) + list(_REGION_COLUMNS):
+        if not cand or cand not in frame.columns:
+            continue
+        labels = _column_labels(ctx, str(cand), n)
+        if labels is None:
+            continue
+        valid = [v for v in labels if v not in ("NA", "")]
+        if len(valid) >= 1:
+            return labels, str(cand)
+    return None, ""
+
+
+def _unit_table(ctx, n: int, group_col: str = ""):
+    """构造 供体/切片（物理块） × 区域 的观测单位表（不做统计，只分组）。
+
+    返回 ``dict``：units=[{block, region, group, n_spots, indices}]、block_key、region_key、
+    group_key、warnings；无分组时返回 None。
+    """
+    groups, gkey = _group_values(ctx, n, group_col)
+    if groups is None:
+        return None
+    blocks, block_names, block_key, block_warns = _blocks(ctx)
+    block_id = np.zeros(n, dtype=int)
+    for i, idx in enumerate(blocks):
+        block_id[np.asarray(idx, dtype=int)] = i
+    region_labels, region_key = _region_labels(ctx, n, _p_str((ctx or {}).get("region_col")))
+    if region_labels is None:
+        region_labels = ["all"] * n
+        region_key = "all"
+    grouped: dict[tuple[int, str], list[int]] = {}
+    for i in range(n):
+        grouped.setdefault((int(block_id[i]), str(region_labels[i])), []).append(i)
+    units: list[dict] = []
+    warnings: list[str] = list(block_warns or [])
+    mixed: list[str] = []
+    for (bi, region), idx in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        idx_arr = np.asarray(idx, dtype=int)
+        unit_groups = [str(groups[i]) for i in idx_arr]
+        uniq_g = list(dict.fromkeys(unit_groups))
+        if len(uniq_g) > 1:
+            mixed.append(f"{block_names[bi]}/{region}")
+        units.append({"block": str(block_names[bi]), "region": str(region),
+                      "group": uniq_g[0] if uniq_g else "NA",
+                      "n_spots": int(idx_arr.size), "indices": idx_arr})
+    if mixed:
+        warnings.append(
+            "以下 切片×区域 单位里混有多个分组取值（切片列与分组列可能交叉）："
+            + "、".join(mixed[:6]) + "；单位级检验按该单位首个 spot 的分组归类，结果需谨慎")
+    return {"units": units, "block_key": block_key, "region_key": region_key,
+            "group_key": gkey, "warnings": warnings}
+
+
+def _unit_expression(ctx, units: list[dict], genes: list[str],
+                     min_unit_spots: int = 5) -> tuple[np.ndarray, list[dict], list[str]]:
+    """把每个 供体/切片×区域 单位聚合成一行表达（原始 counts 求和 → log1p CPM）。
+
+    * 优先用 ``ctx["counts"]``（原始 counts）：单位内按基因求和 → log1p(1e6·count/库大小)，
+      这就是 pseudobulk（单位级）表达，供体/切片是生物学重复；
+    * 没有 counts 时退回对当前矩阵求和并写 warning（不是真正的 pseudobulk counts）。
+    """
+    X, _genes, _spots = _matrix(ctx)
+    counts = ctx.get("counts")
+    use_counts = counts is not None and np.asarray(counts).shape == X.shape
+    source = np.asarray(counts if use_counts else X, dtype=np.float64)
+    warnings: list[str] = []
+    if not use_counts:
+        warnings.append(
+            "数据集没有原始 counts：单位聚合改用当前表达矩阵求和（不是真正的 pseudobulk counts），"
+            "组间比较的量级需谨慎解读")
+    kept: list[dict] = []
+    rows: list[np.ndarray] = []
+    dropped = 0
+    for unit in units:
+        idx = np.asarray(unit["indices"], dtype=int)
+        if idx.size < int(max(1, min_unit_spots)):
+            dropped += 1
+            continue
+        agg = np.nansum(source[idx], axis=0)
+        lib = float(np.nansum(agg))
+        if lib <= 0:
+            dropped += 1
+            continue
+        rows.append(np.log1p(1e6 * agg / lib))
+        kept.append(unit)
+    if dropped:
+        warnings.append(f"{dropped} 个单位 spot 数 < {min_unit_spots} 或总 counts 为 0，已从单位级检验中剔除")
+    if not rows:
+        raise sc.prerequisite(
+            f"没有 spot 数 ≥ {min_unit_spots} 的 供体/切片×区域 单位：请降低 min_unit_spots，或检查切片/区域列")
+    return np.vstack(rows), kept, warnings
+
+
+def _unit_de_frame(U: np.ndarray, genes: list[str], case_mask: np.ndarray, ctrl_mask: np.ndarray,
+                   *, test: bool = True) -> pd.DataFrame:
+    """单位级差异表：每行一个基因。
+
+    test=True：单位间 Wilcoxon 秩和（scipy mannwhitneyu，method=auto）+ BH；
+    test=False：只给描述性汇总（均值/logFC/阳性比例），p 值与 FDR 留空（NaN）。
+    """
+    A = np.asarray(U[case_mask], dtype=float)
+    B = np.asarray(U[ctrl_mask], dtype=float)
+    n_genes = len(genes)
+    mean_case = A.mean(axis=0) if A.size else np.full(n_genes, np.nan)
+    mean_ctrl = B.mean(axis=0) if B.size else np.full(n_genes, np.nan)
+    pct_case = (A > 0).mean(axis=0) * 100.0 if A.size else np.full(n_genes, np.nan)
+    pct_ctrl = (B > 0).mean(axis=0) * 100.0 if B.size else np.full(n_genes, np.nan)
+    if test and A.shape[0] >= 2 and B.shape[0] >= 2:
+        from scipy import stats
+
+        pvals = np.ones(n_genes, dtype=float)
+        for j in range(n_genes):
+            try:
+                _stat, p = stats.mannwhitneyu(A[:, j], B[:, j], alternative="two-sided",
+                                              method="auto")
+                pvals[j] = float(p) if np.isfinite(p) else 1.0
+            except Exception:  # noqa: BLE001 - 单基因退化时按不显著处理
+                pvals[j] = 1.0
+        pvals = np.clip(pvals, 0.0, 1.0)
+        frame = pd.DataFrame({
+            "gene": genes,
+            "logFC": mean_case - mean_ctrl,
+            "mean_case": mean_case,
+            "mean_ctrl": mean_ctrl,
+            "pct_case": pct_case,
+            "pct_ctrl": pct_ctrl,
+            "p_value": pvals,
+            "p_adj": sc.bh_fdr(pvals),
+        })
+    else:
+        frame = pd.DataFrame({
+            "gene": genes,
+            "logFC": mean_case - mean_ctrl,
+            "mean_case": mean_case,
+            "mean_ctrl": mean_ctrl,
+            "pct_case": pct_case,
+            "pct_ctrl": pct_ctrl,
+            "p_value": np.nan,
+            "p_adj": np.nan,
+        })
+    frame["regulation"] = np.where(
+        (frame["p_adj"] <= 0.05) & (frame["logFC"] > 0), "up",
+        np.where((frame["p_adj"] <= 0.05) & (frame["logFC"] < 0), "down", "ns"))
+    return frame
+
+
 def _analysis_de_groups(ctx, params=None, outdir=None):
+    """按分组差异（单位级）：以 供体/切片 × 区域 为观测单位做 pseudobulk 比较。
+
+    为什么不能再按 spot 做 Wilcoxon：同一张切片上的 spot 不是独立生物学重复，切片内 spot 数
+    再多也只代表 1 个供体/切片 —— 这就是空间伪重复（pseudoreplication），会把 p 值压到 1e-9
+    量级。正确做法：每个 供体/切片×区域 单位先把原始 counts 聚合成 pseudobulk（log1p CPM），
+    单位之间再做 Wilcoxon + BH；每组只有 1 个供体/切片时只输出**描述性**（descriptive）汇总，
+    **不做推断**（inferential）。
+    """
     params = dict(params or {})
     outdir = _outdir(ctx, outdir)
     X, genes, spots = _matrix(ctx)
@@ -2443,11 +2717,89 @@ def _analysis_de_groups(ctx, params=None, outdir=None):
         control = [g for g in uniq if g != case][0]
     if case == control:
         raise sc.bad_request("case 与 control 相同，请选择不同的两组")
-    labels_arr = np.asarray(groups, dtype=object)
-    frame = _wilcoxon_frame(X, genes, labels_arr == case, labels_arr == control)
+
+    min_unit_spots = int(max(2, min(_p_int(params.get("min_unit_spots"), 5), 1000)))
+    unit_info = _unit_table(ctx, n, group_col)
+    units = list(unit_info["units"])
+    block_key = unit_info["block_key"] or "单块"
+    region_key = unit_info["region_key"]
+    warnings: list[str] = list(unit_info["warnings"])
+
+    U, kept_units, agg_warnings = _unit_expression(ctx, units, genes,
+                                                   min_unit_spots=min_unit_spots)
+    warnings.extend(agg_warnings)
+    # 单位矩阵的行顺序与 kept_units 一致，用布尔掩码取组
+    unit_groups = np.asarray([u["group"] for u in kept_units], dtype=object)
+    case_mask = unit_groups == case
+    ctrl_mask = unit_groups == control
+    n_case_units = int(case_mask.sum())
+    n_ctrl_units = int(ctrl_mask.sum())
+    # 推断的前提是「每组独立供体/切片 ≥ 2」；同一供体的多个区域不是独立生物学重复
+    case_blocks = {u["block"] for u in kept_units if u["group"] == case}
+    ctrl_blocks = {u["block"] for u in kept_units if u["group"] == control}
+    n_case_blocks = len(case_blocks)
+    n_ctrl_blocks = len(ctrl_blocks)
+    inference = "unit_level" if (n_case_blocks >= 2 and n_ctrl_blocks >= 2) else "descriptive"
+    unit_desc = f"{block_key}×{region_key}"
+    notes_extra = [
+        f"单位定义：{block_key} × {region_key}；每个单位把原始 counts 聚合成 pseudobulk（log1p CPM）"
+        if ctx.get("counts") is not None else
+        f"单位定义：{block_key} × {region_key}；每个单位聚合成一行表达（数据集没有 counts，用当前矩阵求和）",
+        "空间数据里同一张切片的 spot 不是独立重复：按 spot 做检验会把 p 值压到 1e-9 量级（空间伪重复）；"
+        "本分析按 供体/切片×区域 单位做检验",
+    ]
+    metrics_extra = {
+        "inference": inference,
+        "n_units": int(len(kept_units)),
+        "n_case_units": n_case_units,
+        "n_ctrl_units": n_ctrl_units,
+        "n_case_blocks": n_case_blocks,
+        "n_ctrl_blocks": n_ctrl_blocks,
+        "unit": unit_desc,
+        "n_units_dropped": int(len(units) - len(kept_units)),
+        "min_unit_spots": min_unit_spots,
+        "block_key": block_key,
+        "region_key": region_key,
+    }
+
+    if inference == "descriptive":
+        frame = _unit_de_frame(U, genes, case_mask, ctrl_mask, test=False)
+        warnings.append(
+            f"描述性（descriptive）：{case} 有 {n_case_blocks} 个独立供体/切片、{control} 有 {n_ctrl_blocks} 个"
+            f"（共 {n_case_units}/{n_ctrl_units} 个单位，单位={unit_desc}）；每组独立供体/切片不足 2 个，"
+            "属空间伪重复风险，不允许做推断（inferential），不报告 p 值")
+        bullet = (f"{case} vs {control}：仅描述性汇总（独立供体/切片 {n_case_blocks} / {n_ctrl_blocks} 个，"
+                  f"{n_case_units} / {n_ctrl_units} 个单位 {unit_desc}）；每组独立供体/切片 < 2，"
+                  "不做推断、不给 p 值")
+        desc_notes = [
+            "方法：描述性（descriptive）汇总——单位级 pseudobulk 的组均值/占比；"
+            "每组独立供体/切片 < 2，不做推断（inferential），不报告 p 值",
+            "降级原因：每组只有 1 个供体/切片时，spot 级 p 值来自伪重复，不可作为推断证据",
+        ]
+        return _de_result(
+            ctx, params, outdir, frame=frame, title=f"按「{gkey}」分组差异（{case} vs {control}，描述性）",
+            case_label=case, ctrl_label=control, warnings=warnings,
+            metrics_extra=metrics_extra, bullet_head=bullet,
+            notes_extra=notes_extra, notes_base=desc_notes,
+            table_note=f"{case} vs {control}；仅描述性汇总（n_units={len(kept_units)}，不报告推断 p 值）",
+        )
+
+    frame = _unit_de_frame(U, genes, case_mask, ctrl_mask, test=True)
+    n_sig = int(((frame["p_adj"] <= 0.05) & (frame["logFC"] != 0)).sum())
+    bullet = (f"{case} vs {control}（单位级 Wilcoxon + BH）：{n_case_units} vs {n_ctrl_units} 个单位"
+              f"（{unit_desc}），显著 {n_sig} / {len(frame)} 个基因")
+    unit_notes = [
+        "方法：单位级 Wilcoxon 秩和检验（scipy mannwhitneyu，method=auto 小样本用精确分布）+ BH FDR；"
+        "logFC = 单位 pseudobulk（log1p CPM）的组均值差；pct 为单位中表达 >0 的百分比",
+        "空间数据里同一张切片的 spot 不是独立重复：按 spot 做检验会把 p 值压到 1e-9 量级（空间伪重复）；"
+        "本分析按 供体/切片×区域 单位做检验",
+    ]
     return _de_result(
-        ctx, params, outdir, frame=frame, title=f"按「{gkey}」分组差异（{case} vs {control}）",
-        case_label=case, ctrl_label=control,
+        ctx, params, outdir, frame=frame, title=f"按「{gkey}」分组差异（{case} vs {control}，单位级）",
+        case_label=case, ctrl_label=control, warnings=warnings,
+        metrics_extra=metrics_extra, bullet_head=bullet, notes_extra=notes_extra,
+        notes_base=unit_notes,
+        table_note=f"{case} vs {control}；单位级（{unit_desc}）Wilcoxon + BH FDR",
     )
 
 
@@ -2982,7 +3334,7 @@ def plot_niche_map(ctx, params=None, outdir=None) -> dict:
         labels_obj, _key = _cluster_labels(ctx, _p_str(params.get("cluster_key")))
         coords = _coords(ctx)
         k = int(max(2, min(_p_int(params.get("k"), 8), 30)))
-        comp, uniq = _neighborhood_composition(labels_obj, coords, k)
+        comp, uniq = _neighborhood_composition(labels_obj, coords, k, blocks=_blocks(ctx)[0])
         n_niches = int(max(2, min(_p_int(params.get("n_niches"), 5), 20)))
         n_niches = min(n_niches, max(2, comp.shape[0] // 10))
         from sklearn.cluster import KMeans
@@ -2996,7 +3348,9 @@ def plot_diversity(ctx, params=None, outdir=None) -> dict:
     """邻域多样性空间图（现场计算）。"""
     params = dict(params or {})
     labels, _key = _cluster_labels(ctx, _p_str(params.get("cluster_key")))
-    res = _diversity_core(labels, _coords(ctx), int(max(2, min(_p_int(params.get("k"), 6), 30))))
+    res = _diversity_core(labels, _coords(ctx),
+                          int(max(2, min(_p_int(params.get("k"), 6), 30))),
+                          blocks=_blocks(ctx)[0])
     return _diversity_figure(ctx, params, _outdir(ctx, outdir), shannon=res["shannon"], simpson=res["simpson"])
 
 

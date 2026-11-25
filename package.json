@@ -20,6 +20,7 @@
     "icon.svg",
     "lib/*.mjs",
     "lib/*.py",
+    "lib/*.R",
     "test/make_fixtures.py",
     "test/make_demo.py",
     "README.md",

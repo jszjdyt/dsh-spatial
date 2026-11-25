@@ -5,14 +5,20 @@ dsh-spatial — 基础流程步骤与分析（DESIGN.md §3 / §4 group=质控�
   STEPS   : qc / filter / normalize / hvg / pca / neighbors / cluster / embed / annotate
   ANALYSES: qc_summary / outlier_spots / slice_align / spatial_trajectory
 
-全部用 numpy/scipy/sklearn 自实现（本机无 scanpy/umap-learn/leidenalg）：
-  * 标准化        log1p(CPM-like)（扫描式文库大小校正，Luecken & Theis 2019 常规做法）
-  * 高变基因      Seurat v3 的分箱 dispersion（Stuart 2019）或 Cell Ranger 的归一化 dispersion
-  * PCA           z-score 后 SVD
-  * 邻接图        表达 kNN（cosine）与空间图按 spatial_weight 融合（空间平滑正则，BayesSpace/GraphST 思想）
-  * 聚类          networkx Louvain（Blondel 2008），resolution 控制粒度
-  * 二维嵌入      sklearn TSNE（van der Maaten & Hinton 2008）或 PCA
+核心计算优先调用主流包 **scanpy + squidpy**（`scanpy.pp/tl` 的标准化、HVG、PCA、
+邻居图、Leiden 聚类、t-SNE/UMAP，`squidpy.gr.spatial_neighbors` 的空间邻接）：
+  * 标准化        scanpy.pp.normalize_total + scanpy.pp.log1p
+  * 高变基因      scanpy.pp.highly_variable_genes（有原始 counts 用 seurat_v3，否则 seurat / cell_ranger）
+  * PCA           scanpy.pp.scale(max_value=10) + scanpy.tl.pca
+  * 邻接图        scanpy.pp.neighbors（use_rep=X_pca）+ squidpy.gr.spatial_neighbors，按 spatial_weight 融合
+  * 聚类          scanpy.tl.leiden(flavor="igraph")（无 leidenalg 时 scanpy.tl.louvain）
+  * 二维嵌入      scanpy.tl.tsne / scanpy.tl.umap
   * 空间轨迹      扩散伪时序（Haghverdi 2016 DPT 思想：转移矩阵特征分解 + 扩散距离）
+  * 质控指标      scanpy.pp.calculate_qc_metrics（线粒体比例）
+
+依赖是**可选**的：宿主默认 `python3` 没有 scanpy/squidpy，此时整段回退到原来的
+numpy/scipy/sklearn 自实现（结果结构、键名完全一致），并在 summary.method 里写明
+"回退内置实现（scanpy 不可用）"。
 """
 
 from __future__ import annotations
@@ -28,6 +34,9 @@ from sp_common import (
     PALETTE,
     add_image_background,
     bh_fdr,
+    blocked_coord_knn,
+    blocked_radius_estimate,
+    blocked_radius_graph,
     categorical_colors,
     coord_knn,
     ensure_dir,
@@ -40,9 +49,115 @@ from sp_common import (
     result,
     save_fig,
     scatter_spatial,
+    spatial_blocks,
     spatial_weights,
     table,
 )
+
+# ---------------------------------------------------------------------------
+# 可选依赖：scanpy / squidpy / anndata
+# 本机 /Users/dingyuntao/.dsh/runtimes/bio312/bin/python 已装；宿主 python3 (3.14) 没有。
+# 只做 try-import，**不写进 requirements 的硬依赖**：导入失败就整段回退自实现。
+# ---------------------------------------------------------------------------
+
+try:
+    import anndata as _anndata
+except Exception:  # noqa: BLE001 - 缺 anndata 时一并回退
+    _anndata = None
+
+try:
+    import scanpy as _scanpy
+except Exception:  # noqa: BLE001
+    _scanpy = None
+
+try:
+    import squidpy as _squidpy
+except Exception:  # noqa: BLE001
+    _squidpy = None
+
+HAS_ANNDATA = _anndata is not None
+HAS_SCANPY = _scanpy is not None
+HAS_SQUIDPY = _squidpy is not None
+
+if HAS_SCANPY:  # 不往 stderr 刷 scanpy 的 INFO 日志（引擎会收集日志）
+    try:
+        _scanpy.settings.verbosity = 0
+    except Exception:  # noqa: BLE001
+        pass
+if HAS_SQUIDPY:  # 同理压低 squidpy 的 INFO（"Creating graph using ..."，走 spatialdata 的 logger）
+    try:
+        import logging as _logging
+
+        for _name in ("squidpy", "spatialdata", "spatialdata._logging"):
+            _logging.getLogger(_name).setLevel(_logging.ERROR)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pkg_version(module) -> str:
+    """包的版本号（只用于 method/notes 文本，失败时给 "?"）。"""
+    name = getattr(module, "__name__", "") if module is not None else ""
+    if not name:
+        return "?"
+    try:
+        from importlib.metadata import version
+
+        return str(version(name.split(".")[0]))
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def _with_method(payload: dict, method: str, notes=None) -> dict:
+    """在结果信封的 summary 里写 ``method``（用了哪个包函数），并可追加 notes。"""
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        payload["summary"] = summary
+    summary["method"] = str(method)
+    if notes:
+        payload["notes"] = [str(item) for item in (payload.get("notes") or [])] + [str(n) for n in notes]
+    return payload
+
+
+def _var_names(genes, n: int) -> list[str]:
+    """给 AnnData 用的唯一 var 名（重名时加序号；对外仍用 ctx.genes）。"""
+    out: list[str] = []
+    seen: dict[str, int] = {}
+    for i in range(int(n)):
+        base = str(genes[i]) if genes is not None and i < len(genes) else f"GENE{i + 1}"
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        out.append(base if count == 0 else f"{base}__dup{count}")
+    return out
+
+
+def _make_adata(X, genes=None, coords=None, obs: dict | None = None):
+    """构造 AnnData：X 用 float32，obsm["spatial"] 放坐标，var_names 唯一。"""
+    if not HAS_ANNDATA:
+        raise EngineError("internal", "anndata 不可用")
+    arr = np.asarray(X, dtype=np.float32)
+    adata = _anndata.AnnData(X=np.array(arr, copy=True))
+    adata.var_names = _var_names(genes, arr.shape[1])
+    if coords is not None:
+        arrc = np.asarray(coords, dtype=np.float64)
+        adata.obsm["spatial"] = np.array(arrc[:, :2], copy=True)
+    for key, value in (obs or {}).items():
+        adata.obs[str(key)] = value
+    return adata
+
+
+def _counts_matrix(ctx, shape: tuple[int, int]):
+    """取与 X 同形状的原始 counts（seurat_v3 需要）；没有或形状不符就返回 None。"""
+    raw = ctx.get("counts")
+    if raw is None:
+        return None
+    try:
+        arr = _dense(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.ndim != 2 or arr.shape != tuple(shape):
+        return None
+    return arr
 
 # ---------------------------------------------------------------------------
 # ctx 小工具
@@ -170,7 +285,7 @@ def _mt_mask(genes: list[str]) -> np.ndarray:
                      for g in genes], dtype=bool)
 
 
-def _spot_metrics(X: np.ndarray, genes: list[str]) -> pd.DataFrame:
+def _spot_metrics_builtin(X: np.ndarray, genes: list[str]) -> pd.DataFrame:
     counts = np.asarray(X.sum(axis=1), dtype=np.float64)
     detected = np.asarray((X > 0).sum(axis=1), dtype=np.int64)
     mt = _mt_mask(genes)
@@ -185,6 +300,40 @@ def _spot_metrics(X: np.ndarray, genes: list[str]) -> pd.DataFrame:
         "genes": detected,
         "pct_mt": pct_mt,
     })
+
+
+def _spot_metrics_scanpy(X: np.ndarray, genes: list[str]) -> pd.DataFrame:
+    """scanpy.pp.calculate_qc_metrics 的 spot 级指标（列与内置实现完全一致）。"""
+    adata = _make_adata(X, genes=genes)
+    mt = _mt_mask(genes)
+    qc_vars: list[str] = []
+    if mt.any():
+        adata.var["mt"] = mt
+        qc_vars = ["mt"]
+    obs, _var = _scanpy.pp.calculate_qc_metrics(
+        adata, qc_vars=qc_vars, percent_top=None, log1p=False, inplace=False)
+    counts = np.asarray(obs["total_counts"], dtype=np.float64)
+    detected = np.asarray(obs["n_genes_by_counts"], dtype=np.int64)
+    if mt.any() and "pct_counts_mt" in obs.columns:
+        pct_mt = np.nan_to_num(np.asarray(obs["pct_counts_mt"], dtype=np.float64), nan=0.0)
+    else:
+        pct_mt = np.zeros(X.shape[0], dtype=np.float64)
+    return pd.DataFrame({
+        "spot": list(range(X.shape[0])),
+        "counts": counts,
+        "genes": detected,
+        "pct_mt": pct_mt,
+    })
+
+
+def _spot_metrics(X: np.ndarray, genes: list[str]) -> pd.DataFrame:
+    """spot 级 QC 指标：优先 scanpy.pp.calculate_qc_metrics，不可用/失败时回退内置实现。"""
+    if HAS_SCANPY:
+        try:
+            return _spot_metrics_scanpy(X, genes)
+        except Exception:  # noqa: BLE001 - 包行为异常时静默回退，保证流程不中断
+            pass
+    return _spot_metrics_builtin(X, genes)
 
 
 def _gene_stats(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -338,7 +487,9 @@ def step_qc(ctx, params, outdir):
         figures=figures,
         data_out=data_out,
     )
-    return payload
+    qc_method = ("scanpy.pp.calculate_qc_metrics(qc_vars=[mt], percent_top=None) + spot 统计"
+                 if HAS_SCANPY else "回退内置实现（scanpy 不可用）：spot 汇总统计")
+    return _with_method(payload, qc_method)
 
 
 def result_fmt(value) -> str:
@@ -408,7 +559,7 @@ def step_filter(ctx, params, outdir):
         _fig_spatial_metric(ctx, outdir, keep.astype(float), "filter-keep-spatial",
                             "Kept spots (1=kept)", "kept", point_size=6.0),
     ]
-    return result(
+    payload = result(
         summary={"title": "过滤", "bullets": bullets, "metrics": {
             "n_spots_before": int(X.shape[0]), "n_spots_after": int(X2.shape[0]),
             "n_genes_before": int(X.shape[1]), "n_genes_after": int(X2.shape[1]),
@@ -416,11 +567,22 @@ def step_filter(ctx, params, outdir):
         figures=figures,
         replace=replace,
     )
+    return _with_method(payload, "内置实现（numpy/pandas 阈值筛选；scanpy 无对应单步 API）")
 
 
 # ---------------------------------------------------------------------------
 # 步骤：normalize
 # ---------------------------------------------------------------------------
+
+
+def _normalize_builtin(arr: np.ndarray, target_sum: float, use_log: bool) -> np.ndarray:
+    """回退实现：文库大小校正（CPM-like）+ log1p（Luecken & Theis 2019 常规做法）。"""
+    lib = np.asarray(arr.sum(axis=1), dtype=np.float64)
+    lib[lib <= 0] = 1.0
+    scaled = arr / lib[:, None] * float(target_sum)
+    if use_log:
+        scaled = np.log1p(scaled)
+    return np.asarray(scaled, dtype=np.float32)
 
 
 def step_normalize(ctx, params, outdir):
@@ -430,21 +592,40 @@ def step_normalize(ctx, params, outdir):
     method = str((params or {}).get("method") or "lognorm").strip().lower()
     kind = str(ctx.get("X_kind") or "unknown")
     if method == "none":
-        return result(summary={"title": "标准化（跳过）",
-                               "bullets": ["按参数跳过标准化：注意后续分析的可比性"],
-                               "metrics": {"X_kind": kind}})
+        return _with_method(result(summary={"title": "标准化（跳过）",
+                                           "bullets": ["按参数跳过标准化：注意后续分析的可比性"],
+                                           "metrics": {"X_kind": kind}}),
+                            "跳过（method=none，未调用 scanpy）")
     if kind == "lognorm":
-        return result(summary={"title": "标准化（已标准化）",
-                               "bullets": ["数据已经是 lognorm 尺度，本次不重复标准化"],
-                               "metrics": {"X_kind": kind, "skipped": True}})
+        return _with_method(result(summary={"title": "标准化（已标准化）",
+                                           "bullets": ["数据已经是 lognorm 尺度，本次不重复标准化"],
+                                           "metrics": {"X_kind": kind, "skipped": True}}),
+                            "跳过（数据已是 lognorm 尺度）")
     arr = np.asarray(X, dtype=np.float64)
     lib = np.asarray(arr.sum(axis=1), dtype=np.float64)
     lib[lib <= 0] = 1.0
-    scaled = arr / lib[:, None] * float(target_sum)
-    if use_log:
-        scaled = np.log1p(scaled)
-    scaled = scaled.astype(np.float32)
     before_median = float(np.median(lib))
+
+    scaled = None
+    warnings_list: list[str] = []
+    if HAS_SCANPY:
+        try:
+            adata = _make_adata(arr, genes=_genes(ctx))
+            _scanpy.pp.normalize_total(adata, target_sum=float(target_sum))
+            if use_log:
+                _scanpy.pp.log1p(adata)
+            scaled = np.asarray(adata.X, dtype=np.float32)
+            backend = (f"scanpy.pp.normalize_total(target_sum={float(target_sum):g})"
+                       + (" + scanpy.pp.log1p" if use_log else "")
+                       + f"（scanpy {_pkg_version(_scanpy)}）")
+            method_text = backend
+        except Exception as error:  # noqa: BLE001 - 包失败则回退，不让流程中断
+            warnings_list.append(f"scanpy 标准化失败（{type(error).__name__}: {error}），回退内置实现")
+    if scaled is None:
+        scaled = _normalize_builtin(arr, float(target_sum), bool(use_log))
+        method_text = "回退内置实现（scanpy 不可用）：文库大小校正 + log1p"
+        backend = "内置实现"
+
     figures = [
         _fig_hist(ctx, outdir, [("library size (before)", lib)], "normalize-libsize",
                   "Library size before normalization", "library size"),
@@ -456,18 +637,63 @@ def step_normalize(ctx, params, outdir):
         f"counts → {'log1p' if use_log else ''}(CPM-like)，目标总量 {result_fmt(target_sum)}",
         f"标准化前中位文库大小 {before_median:.0f}；输出 X_kind=lognorm",
     ]
-    return result(
-        summary={"title": "标准化", "bullets": bullets,
-                 "metrics": {"target_sum": float(target_sum), "log": bool(use_log),
-                             "median_lib": before_median, "X_kind": "lognorm"}},
-        figures=figures,
-        replace={"X": scaled, "X_kind": "lognorm"},
+    return _with_method(
+        result(
+            summary={"title": "标准化", "bullets": bullets,
+                     "metrics": {"target_sum": float(target_sum), "log": bool(use_log),
+                                 "median_lib": before_median, "X_kind": "lognorm",
+                                 "backend": backend}},
+            figures=figures,
+            warnings=warnings_list,
+            replace={"X": scaled, "X_kind": "lognorm"},
+        ),
+        method_text,
+        notes=[f"后端函数：{backend}"],
     )
 
 
 # ---------------------------------------------------------------------------
 # 步骤：hvg
 # ---------------------------------------------------------------------------
+
+
+def _hvg_scanpy(X: np.ndarray, genes: list[str], counts, n_top: int, flavor_req: str):
+    """scanpy.pp.highly_variable_genes：返回 (chosen, score, mean, disp, flavor_used)。"""
+    n_genes = int(X.shape[1])
+    n_top_eff = int(max(1, min(max(50, int(n_top)), n_genes)))
+    hv_cols = ("means", "dispersions", "dispersions_norm", "variances", "variances_norm")
+    if flavor_req == "cell_ranger":
+        adata = _make_adata(X, genes=genes)
+        df = _scanpy.pp.highly_variable_genes(adata, flavor="cell_ranger", n_top_genes=n_top_eff)
+        flavor_used = "cell_ranger"
+    elif counts is not None:
+        # seurat_v3 需要原始 counts（Stuart 2019 的 vst 风格，scanpy 推荐用法）
+        adata = _make_adata(counts, genes=genes)
+        df = _scanpy.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=n_top_eff)
+        flavor_used = "seurat_v3"
+    else:
+        adata = _make_adata(X, genes=genes)
+        df = _scanpy.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=n_top_eff)
+        flavor_used = "seurat"
+    if df is None:  # 老版本 scanpy 不返回 DataFrame
+        df = adata.var
+    flag = np.asarray(df["highly_variable"].fillna(False).to_numpy(), dtype=bool)
+    chosen = [int(i) for i in np.where(flag)[0]]
+    mean = np.nan_to_num(np.asarray(df["means"] if "means" in df else np.zeros(n_genes),
+                                    dtype=np.float64), nan=0.0)
+    if "dispersions" in df:
+        disp = np.nan_to_num(np.asarray(df["dispersions"], dtype=np.float64), nan=0.0)
+    elif "variances" in df:
+        disp = np.nan_to_num(np.asarray(df["variances"], dtype=np.float64), nan=0.0)
+    else:
+        disp = np.zeros(n_genes, dtype=np.float64)
+    score_col = next((c for c in ("dispersions_norm", "variances_norm", "highly_variable_rank")
+                      if c in df), None)
+    if score_col is not None:
+        score = np.nan_to_num(np.asarray(df[score_col], dtype=np.float64), nan=0.0)
+    else:
+        score = disp.copy()
+    return chosen, score, mean, disp, flavor_used
 
 
 def step_hvg(ctx, params, outdir):
@@ -482,50 +708,78 @@ def step_hvg(ctx, params, outdir):
     if valid.sum() < 10:
         raise prerequisite("可用基因太少（很多基因在绝大多数 spot 不表达）")
     disp = np.where(mean > 0, var / np.maximum(mean, 1e-9), 0.0)
-    if flavor == "cell_ranger":
-        bins = np.linspace(np.log1p(mean[valid].min()), np.log1p(mean[valid].max()) + 1e-9, 21)
-        score = np.zeros_like(disp)
-        idx_valid = np.where(valid)[0]
-        assign = np.digitize(np.log1p(mean[idx_valid]), bins) - 1
-        for group in np.unique(assign):
-            sel = idx_valid[assign == group]
-            if sel.size < 3:
-                score[sel] = 0.0
-                continue
-            values = disp[sel]
-            mu, sd = float(np.mean(values)), float(np.std(values) + 1e-12)
-            score[sel] = (values - mu) / sd
-    else:
-        # Seurat v3：按平均表达分箱后对 dispersion 做组内 z-score
-        idx_valid = np.where(valid)[0]
-        values = np.log1p(mean[idx_valid])
-        bins = np.quantile(values, np.linspace(0, 1, 21))
-        bins[0] -= 1e-9
-        bins[-1] += 1e-9
-        assign = np.digitize(np.log1p(mean[idx_valid]), bins) - 1
-        score = np.zeros_like(disp)
-        for group in np.unique(assign):
-            sel = idx_valid[assign == group]
-            if sel.size < 3:
-                score[sel] = 0.0
-                continue
-            sub = disp[sel]
-            mu, sd = float(np.mean(sub)), float(np.std(sub) + 1e-12)
-            score[sel] = (sub - mu) / sd
-    order = np.argsort(-np.where(valid, score, -np.inf))
-    n_top = int(max(50, min(n_top, int(valid.sum()))))
-    chosen = [int(i) for i in order[:n_top] if valid[i]]
+
+    chosen = None
+    score = None
+    fig_mean, fig_disp = mean, disp
+    flavor_used = flavor
+    method_text = ""
+    warnings_list: list[str] = []
+    if HAS_SCANPY:
+        try:
+            counts = _counts_matrix(ctx, X.shape)
+            chosen, score, fig_mean, fig_disp, flavor_used = _hvg_scanpy(
+                X, genes, counts, n_top, flavor)
+            method_text = (f"scanpy.pp.highly_variable_genes(flavor={flavor_used}, "
+                           f"n_top_genes={max(1, min(max(50, n_top), X.shape[1]))})"
+                           f"（scanpy {_pkg_version(_scanpy)}）")
+            if flavor_used == "seurat_v3":
+                method_text += "；用原始 counts 计算（seurat_v3 需要 counts）"
+        except Exception as error:  # noqa: BLE001 - 包失败则回退，不让流程中断
+            warnings_list.append(f"scanpy HVG 失败（{type(error).__name__}: {error}），回退内置实现")
+            chosen = None
+
+    if chosen is None or score is None:
+        # ---- 回退：原来的分箱 dispersion 自实现 ----
+        if flavor == "cell_ranger":
+            bins = np.linspace(np.log1p(mean[valid].min()), np.log1p(mean[valid].max()) + 1e-9, 21)
+            score = np.zeros_like(disp)
+            idx_valid = np.where(valid)[0]
+            assign = np.digitize(np.log1p(mean[idx_valid]), bins) - 1
+            for group in np.unique(assign):
+                sel = idx_valid[assign == group]
+                if sel.size < 3:
+                    score[sel] = 0.0
+                    continue
+                values = disp[sel]
+                mu, sd = float(np.mean(values)), float(np.std(values) + 1e-12)
+                score[sel] = (values - mu) / sd
+        else:
+            # Seurat v3：按平均表达分箱后对 dispersion 做组内 z-score
+            idx_valid = np.where(valid)[0]
+            values = np.log1p(mean[idx_valid])
+            bins = np.quantile(values, np.linspace(0, 1, 21))
+            bins[0] -= 1e-9
+            bins[-1] += 1e-9
+            assign = np.digitize(np.log1p(mean[idx_valid]), bins) - 1
+            score = np.zeros_like(disp)
+            for group in np.unique(assign):
+                sel = idx_valid[assign == group]
+                if sel.size < 3:
+                    score[sel] = 0.0
+                    continue
+                sub = disp[sel]
+                mu, sd = float(np.mean(sub)), float(np.std(sub) + 1e-12)
+                score[sel] = (sub - mu) / sd
+        order = np.argsort(-np.where(valid, score, -np.inf))
+        n_top_builtin = int(max(50, min(n_top, int(valid.sum()))))
+        chosen = [int(i) for i in order[:n_top_builtin] if valid[i]]
+        fig_mean, fig_disp = mean, disp
+        flavor_used = flavor
+        method_text = "回退内置实现（scanpy 不可用）：分箱 dispersion 标准化"
+
+    chosen = [int(i) for i in chosen if 0 <= int(i) < X.shape[1]]
+    order = np.argsort(-np.nan_to_num(np.asarray(score, dtype=np.float64), nan=0.0))
     table_rows = []
-    for idx in order[:min(200, len(order))]:
-        if not valid[idx]:
-            continue
-        table_rows.append({"gene": genes[idx], "mean": float(mean[idx]), "dispersion": float(disp[idx]),
-                           "score": float(score[idx]), "pct": float(nonzero[idx] * 100)})
+    for idx in order[:200]:
+        table_rows.append({"gene": genes[idx], "mean": float(fig_mean[idx]),
+                           "dispersion": float(fig_disp[idx]), "score": float(score[idx]),
+                           "pct": float(nonzero[idx] * 100)})
     fig, ax = new_fig(6.4, 4.6)
     sel = np.zeros(X.shape[1], dtype=bool)
     sel[chosen] = True
-    ax.scatter(mean[~sel], np.log1p(disp[~sel]), s=5, color="#b8bcc4", linewidths=0, label="other")
-    ax.scatter(mean[sel], np.log1p(disp[sel]), s=7, color=PALETTE[2], linewidths=0, label="HVG")
+    ax.scatter(fig_mean[~sel], np.log1p(fig_disp[~sel]), s=5, color="#b8bcc4", linewidths=0, label="other")
+    ax.scatter(fig_mean[sel], np.log1p(fig_disp[sel]), s=7, color=PALETTE[2], linewidths=0, label="HVG")
     ax.set_xscale("log")
     ax.set_xlabel("mean expression", fontsize=9)
     ax.set_ylabel("log1p(dispersion)", fontsize=9)
@@ -534,11 +788,11 @@ def step_hvg(ctx, params, outdir):
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     figure = save_fig(fig, outdir, "hvg-scatter", title=None)
-    return result(
+    return _with_method(result(
         summary={"title": "高变基因", "bullets": [
-            f"选出 {len(chosen)} 个高变基因（flavor={flavor}）",
+            f"选出 {len(chosen)} 个高变基因（flavor={flavor_used}）",
             "下一步 PCA 只在这些基因上计算（避免噪声基因主导）"],
-            "metrics": {"n_hvg": len(chosen), "flavor": flavor}},
+            "metrics": {"n_hvg": len(chosen), "flavor": flavor_used}},
         tables=[table("hvg", "高变基因（前 200）",
                       columns=[{"key": "gene", "label": "基因", "type": "string"},
                                {"key": "mean", "label": "平均表达", "type": "number"},
@@ -547,8 +801,10 @@ def step_hvg(ctx, params, outdir):
                                {"key": "pct", "label": "检出率%", "type": "number"}],
                       rows=table_rows)],
         figures=[figure],
+        warnings=warnings_list,
         store={"hvg": chosen, "hvg_genes": [genes[i] for i in chosen]},
-    )
+    ), method_text, notes=[f"后端函数：{method_text}"])
+
 
 
 # ---------------------------------------------------------------------------
@@ -583,9 +839,17 @@ def _scaled_matrix(X: np.ndarray, idx: np.ndarray, scale: bool = True) -> np.nda
 
 
 def _pca_embedding(X: np.ndarray, n_pcs: int) -> tuple[np.ndarray, np.ndarray]:
-    """返回 (scores, explained_variance_ratio)。"""
+    """返回 (scores, explained_variance_ratio)：优先 scanpy.tl.pca，失败回退 sklearn/SVD。"""
     arr = np.asarray(X, dtype=np.float64)
     n_pcs = int(max(2, min(n_pcs, min(arr.shape) - 1)))
+    if HAS_SCANPY:
+        try:
+            adata = _make_adata(arr)
+            _scanpy.tl.pca(adata, n_comps=n_pcs, svd_solver="arpack", random_state=0)
+            ratio = np.asarray(adata.uns["pca"]["variance_ratio"], dtype=float)
+            return np.asarray(adata.obsm["X_pca"], dtype=np.float32), ratio
+        except Exception:  # noqa: BLE001 - 回退 sklearn
+            pass
     try:
         from sklearn.decomposition import PCA
 
@@ -620,8 +884,32 @@ def step_pca(ctx, params, outdir):
     if str(ctx.get("X_kind")) == "counts":
         raise prerequisite("请先跑标准化（PCA 需要 lognorm 表达值）")
     idx = _hvg_indices(ctx)
-    mat = _scaled_matrix(X, idx, scale=scale)
-    scores, ratio = _pca_embedding(mat, n_pcs)
+    scores = None
+    ratio = None
+    method_text = ""
+    warnings_list: list[str] = []
+    backend = "内置实现"
+    if HAS_SCANPY:
+        try:
+            gene_names = _genes(ctx)
+            adata = _make_adata(X, genes=gene_names)
+            adata = adata[:, np.asarray(idx, dtype=int)].copy()
+            if scale:
+                _scanpy.pp.scale(adata, max_value=10)
+            n_comps = int(max(2, min(int(n_pcs), min(adata.shape) - 1)))
+            _scanpy.tl.pca(adata, n_comps=n_comps, svd_solver="arpack", random_state=0)
+            scores = np.asarray(adata.obsm["X_pca"], dtype=np.float32)
+            ratio = np.asarray(adata.uns["pca"]["variance_ratio"], dtype=float)
+            method_text = ("scanpy.pp.scale(max_value=10) + scanpy.tl.pca"
+                           if scale else "scanpy.tl.pca") + f"（scanpy {_pkg_version(_scanpy)}）"
+            backend = method_text
+        except Exception as error:  # noqa: BLE001
+            warnings_list.append(f"scanpy PCA 失败（{type(error).__name__}: {error}），回退内置实现")
+    if scores is None or ratio is None:
+        mat = _scaled_matrix(X, idx, scale=scale)
+        scores, ratio = _pca_embedding(mat, n_pcs)
+        method_text = "回退内置实现（scanpy 不可用）：z-score/SVD PCA"
+        backend = "内置实现"
     fig, ax = new_fig(6.2, 4.2)
     xs = np.arange(1, len(ratio) + 1)
     ax.bar(xs, ratio * 100, color=PALETTE[0], width=0.72)
@@ -636,14 +924,15 @@ def step_pca(ctx, params, outdir):
         f"在 {len(idx)} 个基因上做 PCA（scale={scale}），保留 {scores.shape[1]} 个主成分",
         f"PC1 解释 {ratio[0] * 100:.1f}%，前 5 个累计 {np.cumsum(ratio)[:5].sum() * 100:.1f}%",
     ]
-    return result(
+    return _with_method(result(
         summary={"title": "PCA", "bullets": bullets,
                  "metrics": {"n_pcs": int(scores.shape[1]), "pc1": float(ratio[0]),
-                             "cum5": float(np.cumsum(ratio)[:5].sum())}},
+                             "cum5": float(np.cumsum(ratio)[:5].sum()), "backend": backend}},
         figures=[figure],
+        warnings=warnings_list,
         store={"pca": {"coords": scores, "ratio": ratio}},
         coords_store={"pca": scores},
-    )
+    ), method_text, notes=[f"后端函数：{method_text}"])
 
 
 # ---------------------------------------------------------------------------
@@ -690,20 +979,195 @@ def _normalize_graph(graph):
     return sparse.diags(1.0 / row) @ g
 
 
-def _fused_graph(ctx, params) -> object:
+def _spatial_neighbors_call(adata, kind: str, kwargs: dict) -> None:
+    """调 squidpy 的空间邻接：优先 1.8+ 的分方法 API，老版本回退 spatial_neighbors。"""
+    gr = _squidpy.gr
+    specific = {"grid": "spatial_neighbors_grid", "radius": "spatial_neighbors_radius",
+                "knn": "spatial_neighbors_knn"}.get(kind)
+    fn = getattr(gr, specific, None) if specific else None
+    if fn is not None:
+        fn(adata, **kwargs)
+        return
+    legacy = {"grid": dict(coord_type="grid"), "radius": dict(coord_type="generic"),
+              "knn": dict(coord_type="generic")}[kind]
+    gr.spatial_neighbors(adata, **{**legacy, **kwargs})
+
+
+def _physical_radius(ctx, blocks=None) -> float:
+    """物理空间邻接半径。
+
+    单块：ctx["neighbor_radius"]（导入时按合并坐标估计）> 自动估计；
+    多块：**忽略** ctx 里的合并半径（多切片同坐标时它会被跨片最近邻带偏成极小/fallback），
+    改用 ``blocked_radius_estimate``（各块 1.2×最近邻中位数的中位数）。
+    """
+    coords = _coords(ctx)
+    if blocks is not None and len(blocks) > 1:
+        return float(blocked_radius_estimate(coords, blocks))
+    radius = ctx.get("neighbor_radius")
+    try:
+        radius = float(radius) if radius is not None else 0.0
+    except (TypeError, ValueError):
+        radius = 0.0
+    if radius > 0:
+        return radius
+    return float(estimate_radius(coords))
+
+
+def _spatial_graph_squidpy(ctx, n_neighbors: int, blocks=None):
+    """squidpy.gr.spatial_neighbors 的空间邻接（grid 优先，失败回退 generic 半径）。
+
+    多切片（物理块 > 1）时**在每个块内单独建图再拼成全局图**：不同切片同坐标的 spot
+    不会被连成邻居。返回 (稀疏矩阵, 说明文字) 或 (None, 失败原因)。
+    """
+    if not HAS_SQUIDPY:
+        return None, "squidpy 不可用"
+    from scipy import sparse
+
+    coords = _coords(ctx)
+    mode = str(ctx.get("spatial_mode") or "generic").strip().lower()
+    if blocks is None:
+        blocks, _names, _key, _warns = spatial_blocks(ctx)
+    multi = len(blocks) > 1
+    radius = _physical_radius(ctx, blocks)
+    errors: list[str] = []
+    rows_all: list[np.ndarray] = []
+    cols_all: list[np.ndarray] = []
+
+    def _build(sub_coords, block_idx):
+        n_sub = int(sub_coords.shape[0])
+        attempts: list[tuple[str, dict, str]] = []
+        knn = int(max(3, min(n_neighbors, n_sub - 1)))
+        if mode == "grid":
+            attempts.append(("grid", dict(n_neighs=6, n_rings=1),
+                             "squidpy.gr.spatial_neighbors_grid(n_neighs=6, n_rings=1)"))
+        attempts.append(("radius", dict(radius=float(radius)),
+                         f"squidpy.gr.spatial_neighbors_radius(radius={float(radius):.3g})"))
+        attempts.append(("knn", dict(n_neighs=knn),
+                         f"squidpy.gr.spatial_neighbors_knn(n_neighs={knn})"))
+        for kind, kwargs, label in attempts:
+            try:
+                adata = _make_adata(np.zeros((n_sub, 1), dtype=np.float32), coords=sub_coords)
+                _spatial_neighbors_call(adata, kind, kwargs)
+                graph = adata.obsp["spatial_connectivities"]
+                if graph.nnz > 0:
+                    return graph, label
+                errors.append(f"{label}: 邻接为空")
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"{label}: {type(error).__name__}: {error}")
+        return None, None
+
+    labels_used: set[str] = set()
+    for block in blocks:
+        block = np.asarray(block, dtype=int)
+        if block.size < 2:
+            continue
+        graph, label = _build(coords[block], block)
+        if graph is None:
+            return None, "；".join(errors[:2])
+        labels_used.add(str(label))
+        coo = graph.tocoo()
+        rows_all.append(block[coo.row])
+        cols_all.append(block[coo.col])
+    if not rows_all:
+        return None, "邻接为空"
+    rows = np.concatenate(rows_all)
+    cols = np.concatenate(cols_all)
+    data = np.ones(rows.size, dtype=float)
+    out = sparse.csr_matrix((data, (rows, cols)), shape=(coords.shape[0], coords.shape[0]))
+    label = "；".join(sorted(labels_used)[:2])
+    if multi:
+        label = f"{label}（按 {len(blocks)} 个切片/样本分块）"
+    return out, label
+
+
+def _physical_graph(ctx, n_neighbors: int):
+    """物理空间邻接图：按切片/样本（物理块）分别构造，禁止跨片建边。
+
+    返回 ``(graph, label, info)``；``info`` 含 blocks/block_names/block_key/radius/n_blocks/blocked。
+    这是「物理图」与「联合表达图」分离的入口：表达 kNN 可以跨块，物理邻接不行。
+    """
+    coords = _coords(ctx)
+    n = int(coords.shape[0])
+    blocks, names, key, block_warn = spatial_blocks(ctx)
+    multi = len(blocks) > 1
+    radius = _physical_radius(ctx, blocks)
+    info = {"blocks": blocks, "block_names": names, "block_key": key,
+            "radius": float(radius), "n_blocks": int(len(blocks)), "blocked": bool(multi),
+            "warnings": list(block_warn)}
+    graph = None
+    label = ""
+    if HAS_SQUIDPY:
+        graph, label = _spatial_graph_squidpy(ctx, n_neighbors, blocks=blocks)
+        if graph is not None and multi:
+            # squidpy 路径也必须在块内建边：一旦发现跨块边就整体回退内置实现
+            from sp_common import block_edge_counts
+
+            if block_edge_counts(graph, blocks)["n_cross"] > 0:
+                graph = None
+    if graph is None:
+        k_fallback = int(max(3, n_neighbors // 2))
+        if multi:
+            graph = blocked_radius_graph(coords, blocks, radius, k_fallback=k_fallback)
+            label = (f"回退内置实现：按 {len(blocks)} 个切片/样本分块的半径邻居图"
+                     f"（块内半径 {radius:.3g}，块内 k 近邻补足）")
+        else:
+            if n > 12000:
+                # 单块大数据：走 cKDTree 路径，避免 n×n 稠密距离矩阵
+                graph = blocked_radius_graph(coords, [np.arange(n)], radius,
+                                             k_fallback=k_fallback)
+            else:
+                graph = radius_graph(coords, radius, k_fallback=k_fallback)
+            label = f"回退内置实现：半径邻居图（半径 {radius:.3g}）"
+    return graph, label, info
+
+
+def _expr_graph_squidpy(ctx, scores: np.ndarray, n_neighbors: int, metric: str):
+    """scanpy.pp.neighbors(use_rep="X_pca") 的表达 kNN 图；失败返回 (None, 原因)。"""
+    if not HAS_SCANPY:
+        return None, "scanpy 不可用"
+    try:
+        adata = _make_adata(np.zeros((scores.shape[0], 1), dtype=np.float32))
+        adata.obsm["X_pca"] = np.asarray(scores, dtype=np.float32)
+        _scanpy.pp.neighbors(adata, n_neighbors=int(n_neighbors), use_rep="X_pca",
+                             metric=metric, random_state=0)
+        return adata.obsp["connectivities"], (f"scanpy.pp.neighbors(n_neighbors={int(n_neighbors)}, "
+                                              f"use_rep=X_pca, metric={metric})")
+    except Exception as error:  # noqa: BLE001
+        return None, f"scanpy.pp.neighbors 失败：{type(error).__name__}: {error}"
+
+
+def _fused_graph(ctx, params) -> tuple[object, float, str]:
+    """表达图与空间图按 spatial_weight 加权融合（行归一化），返回 (图, 权重, 说明)。
+
+    表达图：scanpy.pp.neighbors（use_rep="X_pca"），**允许跨切片**（表达相似就是相似）；
+    物理图：按切片/样本分块构造（``_physical_graph``），**禁止跨切片**（同坐标不是邻居）。
+    任一包不可用 → 该部分回退内置实现（README / DESIGN 的图语义保持一致）。
+    """
     n_neighbors = _int_params(params, "n_neighbors", 15)
     metric = str((params or {}).get("metric") or "cosine").strip().lower()
+    metric = metric if metric in ("cosine", "euclidean") else "cosine"
     weight = _numeric_params(params, "spatial_weight", 0.3)
     weight = float(np.clip(weight if weight is not None else 0.3, 0.0, 0.95))
     scores, _ratio = _pca_cached(ctx)
-    expr_graph = _normalize_graph(_knn_graph(scores, n_neighbors, metric if metric in ("cosine", "euclidean") else "cosine"))
+
+    expr_graph, expr_label = _expr_graph_squidpy(ctx, scores, n_neighbors, metric)
+    if expr_graph is None:
+        expr_graph = _knn_graph(scores, n_neighbors, metric)
+        expr_label = "回退内置实现：表达 kNN（cosine/euclidean，可跨切片）"
+    expr_graph = _normalize_graph(expr_graph)
     if weight <= 0:
-        return expr_graph, weight, "仅表达图"
-    coords = _coords(ctx)
-    radius = ctx.get("neighbor_radius") or estimate_radius(coords)
-    space = _normalize_graph(radius_graph(coords, radius, k_fallback=max(3, n_neighbors // 2)))
+        return expr_graph, weight, f"仅表达图（{expr_label}）"
+
+    space, space_label, space_info = _physical_graph(ctx, n_neighbors)
+    space = _normalize_graph(space)
     fused = (1.0 - weight) * expr_graph + weight * space
-    return _normalize_graph(fused), weight, f"表达图 {1 - weight:.2f} + 空间图 {weight:.2f}"
+    block_text = (f"物理图按 {space_info['n_blocks']} 个切片/样本分块"
+                  if space_info.get("blocked") else "物理图单块")
+    desc = (f"表达图 {1 - weight:.2f}（{expr_label}）+ 空间图 {weight:.2f}"
+            f"（{space_label}；{block_text}，块内半径 {space_info['radius']:.3g}）")
+    if space_info.get("warnings"):
+        desc += "；" + "；".join(str(item) for item in space_info["warnings"][:2])
+    return _normalize_graph(fused), weight, desc
 
 
 def step_neighbors(ctx, params, outdir):
@@ -718,6 +1182,11 @@ def step_neighbors(ctx, params, outdir):
         n_comp, labels = connected_components(graph, directed=False)
     except Exception:  # noqa: BLE001
         n_comp, labels = 1, np.zeros(n, dtype=int)
+    if HAS_SCANPY and HAS_SQUIDPY:
+        method_text = ("scanpy.pp.neighbors(use_rep=X_pca) + squidpy.gr.spatial_neighbors"
+                       f"（scanpy {_pkg_version(_scanpy)} / squidpy {_pkg_version(_squidpy)}）")
+    else:
+        method_text = "回退内置实现（scanpy 不可用）：kNN + 半径图融合"
     bullets = [
         f"邻接图：{n} 个 spot，平均邻居 {degree.mean():.1f}，连通分量 {n_comp}",
         f"融合方式：{desc}（n_neighbors={n_neighbors}）",
@@ -726,14 +1195,15 @@ def step_neighbors(ctx, params, outdir):
         bullets.append(f"注意：图不连通（{n_comp} 个分量），聚类可能被切成互不相连的块")
     figure = _fig_spatial_metric(ctx, outdir, np.asarray(labels, dtype=float), "neighbors-components",
                                 f"Connected components (n={n_comp})", "component")
-    return result(
+    return _with_method(result(
         summary={"title": "邻接图", "bullets": bullets,
                  "metrics": {"n_neighbors": n_neighbors, "mean_degree": float(degree.mean()),
                              "components": int(n_comp), "spatial_weight": float(weight)}},
         figures=[figure],
         store={"graph": {"n_neighbors": n_neighbors, "spatial_weight": float(weight),
                          "components": int(n_comp)}},
-    )
+    ), method_text, notes=[f"图构造：{desc}"])
+
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +1247,38 @@ def _graph_summary(graph) -> dict:
     return {"shape": list(graph.shape)}
 
 
+def _cluster_scanpy(graph, resolution: float) -> tuple[np.ndarray | None, str]:
+    """scanpy.tl.leiden(flavor="igraph") → 不可用时 scanpy.tl.louvain → None。"""
+    if not HAS_SCANPY:
+        return None, "scanpy 不可用"
+    n = int(graph.shape[0])
+    if n < 2:
+        return None, "spot 数 < 2，无法聚类"
+    try:
+        adata = _make_adata(np.zeros((n, 1), dtype=np.float32))
+        conn = graph.tocsr().astype(np.float64)
+        adata.obsp["connectivities"] = conn
+        adata.obsp["distances"] = conn
+        adata.uns["neighbors"] = {
+            "connectivities_key": "connectivities",
+            "distances_key": "distances",
+            "params": {"n_neighbors": int(max(2, min(50, int(conn.getnnz(axis=1).max() or 2)))),
+                       "method": "umap"},
+        }
+        try:
+            _scanpy.tl.leiden(adata, resolution=float(resolution), flavor="igraph",
+                              n_iterations=2, directed=False, random_state=0)
+            labels = np.asarray(adata.obs["leiden"].astype(int).to_numpy(), dtype=int)
+            return labels, "scanpy.tl.leiden(resolution=..., flavor=igraph, n_iterations=2, directed=False)"
+        except Exception:  # noqa: BLE001 - 无 leidenalg 时试 louvain
+            adata2 = adata.copy()
+            _scanpy.tl.louvain(adata2, resolution=float(resolution), random_state=0)
+            labels = np.asarray(adata2.obs["louvain"].astype(int).to_numpy(), dtype=int)
+            return labels, "scanpy.tl.louvain(resolution=..., random_state=0)"
+    except Exception as error:  # noqa: BLE001
+        return None, f"scanpy 聚类失败：{type(error).__name__}: {error}"
+
+
 def step_cluster(ctx, params, outdir):
     entry = _store(ctx).get("graph")
     if not entry:
@@ -786,17 +1288,31 @@ def step_cluster(ctx, params, outdir):
         graph, _weight, _desc = _fused_graph(ctx, {"n_neighbors": entry.get("n_neighbors", 15),
                                                   "spatial_weight": entry.get("spatial_weight", 0.3)})
     resolution = _numeric_params(params, "resolution", 1.0) or 1.0
-    labels = _louvain(graph, float(resolution))
+    labels = None
+    algo = "Louvain"
+    method_text = ""
+    warnings_list: list[str] = []
+    if HAS_SCANPY:
+        labels, algo_detail = _cluster_scanpy(graph, float(resolution))
+        if labels is not None:
+            algo = "Leiden" if "leiden" in algo_detail else "Louvain"
+            method_text = f"{algo_detail}（scanpy {_pkg_version(_scanpy)}）"
+        else:
+            warnings_list.append(f"{algo_detail}，回退内置 Louvain")
+    if labels is None:
+        labels = _louvain(graph, float(resolution))
+        algo = "Louvain"
+        method_text = "回退内置实现（scanpy 不可用）：networkx Louvain（Blondel 2008）"
     labels_str = [str(int(item)) for item in labels]
     counts = pd.Series(labels_str).value_counts()
     order = _sorted_labels(counts.index.tolist())
     bullets = [
-        f"Louvain 聚类（resolution={result_fmt(resolution)}）得到 {len(order)} 个簇",
+        f"{algo} 聚类（resolution={result_fmt(resolution)}）得到 {len(order)} 个簇",
         "簇大小：" + "，".join(f"{key}:{int(counts[key])}" for key in order[:10]),
     ]
     fig, ax = new_fig(6.0, 5.0)
     scatter_spatial(ax, ctx, labels=labels_str, point_size=7.0, legend_title="cluster")
-    ax.set_title("Louvain clusters", fontsize=10)
+    ax.set_title(f"{algo} clusters", fontsize=10)
     figure_spatial = save_fig(fig, outdir, "cluster-spatial", title=None)
     fig2, ax2 = new_fig(6.4, 3.8)
     positions = np.arange(len(order))
@@ -811,22 +1327,43 @@ def step_cluster(ctx, params, outdir):
     figure_bar = save_fig(fig2, outdir, "cluster-sizes", title=None)
     rows = [{"cluster": key, "n_spots": int(counts[key]),
              "pct": float(counts[key] / max(len(labels), 1) * 100)} for key in order]
-    return result(
+    return _with_method(result(
         summary={"title": "聚类", "bullets": bullets,
-                 "metrics": {"n_clusters": len(order), "resolution": float(resolution)}},
+                 "metrics": {"n_clusters": len(order), "resolution": float(resolution),
+                             "algorithm": algo}},
         tables=[table("clusters", "簇大小",
                       columns=[{"key": "cluster", "label": "簇", "type": "string"},
                                {"key": "n_spots", "label": "spot 数", "type": "number"},
                                {"key": "pct", "label": "占比%", "type": "number"}],
                       rows=rows)],
         figures=[figure_spatial, figure_bar],
+        warnings=warnings_list,
         cluster_store={"key": "clusters", "labels": labels_str},
-    )
+    ), method_text, notes=[f"后端函数：{method_text}"])
+
 
 
 # ---------------------------------------------------------------------------
 # 步骤：embed
 # ---------------------------------------------------------------------------
+
+
+def _embed_scanpy(sub: np.ndarray, layout: str, perplexity: float) -> tuple[np.ndarray, str]:
+    """scanpy.tl.tsne / scanpy.tl.umap（perplexity 自适应）；返回 (坐标, 说明)。"""
+    if not HAS_SCANPY:
+        raise RuntimeError("scanpy 不可用")
+    adata = _make_adata(np.zeros((sub.shape[0], 1), dtype=np.float32))
+    n_pcs = int(min(sub.shape[1], max(2, sub.shape[0] - 1)))
+    adata.obsm["X_pca"] = np.asarray(sub[:, :n_pcs], dtype=np.float32)
+    if layout == "umap":
+        _scanpy.pp.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0)
+        _scanpy.tl.umap(adata, random_state=0)
+        return (np.asarray(adata.obsm["X_umap"], dtype=np.float32),
+                "scanpy.tl.umap(random_state=0)（邻居图 scanpy.pp.neighbors）")
+    perp = float(min(max(5.0, perplexity), max(5.0, (sub.shape[0] - 1) / 3.0)))
+    _scanpy.tl.tsne(adata, n_pcs=n_pcs, use_rep="X_pca", perplexity=perp, random_state=0)
+    return (np.asarray(adata.obsm["X_tsne"], dtype=np.float32),
+            f"scanpy.tl.tsne(n_pcs={n_pcs}, perplexity={perp:.1f}, random_state=0)")
 
 
 def step_embed(ctx, params, outdir):
@@ -837,22 +1374,35 @@ def step_embed(ctx, params, outdir):
     limit = 20000
     index = _subsample(n, limit, seed=0)
     sub = scores[index]
+    method_text = ""
+    warnings_list: list[str] = []
     if layout == "pca":
         emb = sub[:, :2]
         layout = "pca"
-    elif layout in ("tsne", "t-sne"):
-        try:
-            from sklearn.manifold import TSNE
+        method_text = "内置实现：取 PCA 前两个主成分（scanpy 无独立 pca-layout API）"
+    elif layout in ("tsne", "t-sne", "umap"):
+        layout = "umap" if layout == "umap" else "tsne"
+        emb = None
+        if HAS_SCANPY:
+            try:
+                emb, method_text = _embed_scanpy(sub, layout, float(perplexity))
+            except Exception as error:  # noqa: BLE001 - 回退内置 t-SNE
+                warnings_list.append(f"scanpy {layout} 失败（{type(error).__name__}: {error}），回退内置实现")
+        if emb is None:
+            try:
+                from sklearn.manifold import TSNE
 
-            perp = float(min(max(5.0, perplexity), max(5.0, (sub.shape[0] - 1) / 3.0)))
-            emb = TSNE(n_components=2, perplexity=perp, random_state=0, init="pca",
-                       learning_rate="auto").fit_transform(sub)
-            layout = "tsne"
-        except Exception as error:  # noqa: BLE001
-            raise prerequisite(f"t-SNE 失败（{error}）；可改用 layout=pca")
+                perp = float(min(max(5.0, perplexity), max(5.0, (sub.shape[0] - 1) / 3.0)))
+                emb = TSNE(n_components=2, perplexity=perp, random_state=0, init="pca",
+                           learning_rate="auto").fit_transform(sub)
+                layout = "tsne"
+                method_text = "回退内置实现（scanpy 不可用）：sklearn TSNE"
+            except Exception as error:  # noqa: BLE001
+                raise prerequisite(f"t-SNE 失败（{error}）；可改用 layout=pca")
     else:
         emb = sub[:, :2]
         layout = "pca"
+        method_text = "内置实现：未知 layout，退回 PCA 前两维"
     coords_full = np.zeros((n, 2), dtype=np.float32)
     coords_full[index] = np.asarray(emb, dtype=np.float32)
     labels = _column(ctx, ctx.get("cluster_key") or "clusters")
@@ -874,13 +1424,15 @@ def step_embed(ctx, params, outdir):
     figure = save_fig(fig, outdir, f"embedding-{layout}", title=None)
     bullets = [f"{layout.upper()} 二维嵌入完成（{len(index)} 个 spot"
                + ("，已降采样" if len(index) < n else "") + "）"]
-    return result(
+    return _with_method(result(
         summary={"title": "二维嵌入", "bullets": bullets,
                  "metrics": {"layout": layout, "n_points": int(len(index)),
                              "downsampled": bool(len(index) < n)}},
         figures=[figure],
+        warnings=warnings_list,
         coords_store={layout: coords_full},
-    )
+    ), method_text, notes=[f"后端函数：{method_text}"])
+
 
 
 # ---------------------------------------------------------------------------
@@ -911,13 +1463,13 @@ def step_annotate(ctx, params, outdir):
     scatter_spatial(ax, ctx, labels=values, point_size=7.0, legend_title=key)
     ax.set_title(f"Annotation ({key})", fontsize=10)
     figure = save_fig(fig, outdir, "annotate-map", title=None)
-    return result(
+    return _with_method(result(
         summary={"title": "区域注释", "bullets": bullets,
                  "metrics": {"n_labels": len(set(values)), "key": key}},
         figures=[figure],
         sample_columns=[{"key": key, "kind": "categorical"}],
         sample_values={key: values},
-    )
+    ), "内置实现（簇→注释映射；scanpy 无对应单步 API）")
 
 
 # ---------------------------------------------------------------------------
@@ -968,7 +1520,12 @@ def analysis_outlier_spots(ctx, params, outdir):
     z_cut = _numeric_params(params, "z", 3.0) or 3.0
     scores, _ratio = _pca_cached(ctx)
     coords = _coords(ctx)
-    idx, dist = coord_knn(coords, k)
+    # 邻域必须在切片/样本（物理块）内取：跨片同坐标的 spot 不是空间邻居
+    blocks, _block_names, _block_key, block_warn = spatial_blocks(ctx)
+    if len(blocks) > 1:
+        idx, _dist, _k_eff = blocked_coord_knn(coords, blocks, k)
+    else:
+        idx, dist = coord_knn(coords, k)
     if idx.size == 0:
         raise prerequisite("spot 太少，无法做邻域平滑")
     sub = scores[:, : min(15, scores.shape[1])]

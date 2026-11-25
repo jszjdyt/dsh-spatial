@@ -76,7 +76,8 @@ class Worker:
 
         packages: dict = {}
         for name in ("numpy", "pandas", "scipy", "sklearn", "matplotlib", "h5py",
-                     "anndata", "statsmodels", "openpyxl", "networkx", "PIL"):
+                     "anndata", "statsmodels", "openpyxl", "networkx", "PIL",
+                     "scanpy", "squidpy", "umap", "leidenalg", "igraph", "skmisc", "harmonypy"):
             try:
                 module = __import__(name)
                 packages[name] = getattr(module, "__version__", "?")
@@ -138,6 +139,10 @@ class Worker:
         state = self.load_state()
         if args.get("demo"):
             dataset = sp_registry.make_demo(state, name=args.get("name") or "demo-spatial")
+            try:
+                state.select(dataset.id)   # 新建/载入的数据集应当成为当前数据集
+            except Exception:  # noqa: BLE001
+                state.active = dataset.id
             return {"dataset": sp_registry._summary(dataset), "preview": sp_registry.preview(dataset)}
         path = args.get("path") or args.get("url")
         options = {
@@ -156,6 +161,10 @@ class Worker:
         }
         dataset = sp_registry.load_dataset(state, self.workdir, path, options=options,
                                            name=args.get("name"))
+        try:
+            state.select(dataset.id)   # 新导入的数据集应当成为当前数据集
+        except Exception:  # noqa: BLE001
+            state.active = dataset.id
         payload = {"dataset": sp_registry._summary(dataset), "preview": sp_registry.preview(dataset)}
         if getattr(dataset, "_reused", False):
             payload["reused"] = True

@@ -519,6 +519,30 @@ def _platform_key(platform) -> str:
     return key if key in _PLATFORM_MATCH else "all"
 
 
+_PLATFORM_QUERY_TERMS = {
+    "visium": '("Visium"[All Fields] OR "10x Genomics"[All Fields] OR "spatial transcriptomics"[All Fields] OR "spatial transcriptome"[All Fields])',
+    "stereo": '("Stereo-seq"[All Fields] OR "stereo seq"[All Fields] OR "spatial transcriptomics"[All Fields])',
+    "slideseq": '("Slide-seq"[All Fields] OR "slide seq"[All Fields] OR "spatial transcriptomics"[All Fields])',
+    "10x": '("Visium"[All Fields] OR "Xenium"[All Fields] OR "10x Genomics"[All Fields] OR "spatial transcriptomics"[All Fields])',
+    "merfish": '("MERFISH"[All Fields] OR "spatial transcriptomics"[All Fields])',
+    "spatial": '("spatial transcriptomics"[All Fields] OR "spatial transcriptome"[All Fields] OR "Visium"[All Fields] OR "Stereo-seq"[All Fields] OR "Slide-seq"[All Fields] OR "MERFISH"[All Fields])',
+}
+
+_SCORE_RANK = {"high": 0, "mid": 1, "medium": 1, "low": 2}
+
+
+def _platform_clause(platform_key: str) -> str:
+    """把平台选择变成检索式的一部分：选 Visium 就只让 NCBI 回 Visium 相关记录。"""
+    return _PLATFORM_QUERY_TERMS.get(str(platform_key or "all").strip().lower(), "")
+
+
+def _with_platform_clause(term: str, platform_key: str) -> str:
+    clause = _platform_clause(platform_key)
+    if not clause:
+        return term
+    return f"({term}) AND {clause}"
+
+
 def _match_platform(item: dict, platform_key: str) -> bool:
     """客户端平台过滤：看 title/summary + 已判定的 spatial_platform 是否含该桶关键词。"""
     keywords = _PLATFORM_MATCH.get(str(platform_key or "all").strip().lower())
@@ -590,7 +614,15 @@ def _reason(error) -> str:
 
 
 def _network_fail(error) -> EngineError:
-    return EngineError("unsupported", f"NCBI 暂时不可达：{_reason(error)}")
+    reason = _reason(error)
+    if "403" in reason:
+        return EngineError(
+            "unsupported",
+            "NCBI 拒绝了请求（HTTP 403，通常是短时间请求过多被限流）。等 10–30 秒再试；"
+            "如需高频检索，设置环境变量 DSH_NCBI_API_KEY（NCBI 免费申请）可把配额提到 10 次/秒。")
+    if "429" in reason:
+        return EngineError("unsupported", "NCBI 限流（HTTP 429）：请稍后重试，或配置 DSH_NCBI_API_KEY。")
+    return EngineError("unsupported", f"NCBI 暂时不可达：{reason}")
 
 
 def _request(url: str, headers: dict | None = None):
@@ -844,6 +876,18 @@ def _build_query(term: str, species: str, study_type: str, min_samples: int) -> 
     return " AND ".join(clauses)
 
 
+def _eutils_identity() -> dict:
+    """NCBI 建议的 tool/email/api_key（配了 api_key 配额更高、更不容易 403）。"""
+    extra = {"tool": "dsh-spatial"}
+    email = str(os.environ.get("DSH_NCBI_EMAIL") or "").strip()
+    if email:
+        extra["email"] = email
+    api_key = str(os.environ.get("DSH_NCBI_API_KEY") or "").strip()
+    if api_key:
+        extra["api_key"] = api_key
+    return extra
+
+
 def _esearch(query: str, *, retmax: int, retstart: int = 0) -> tuple[list[str], int, str]:
     params = urllib.parse.urlencode({
         "db": "gds",
@@ -851,6 +895,7 @@ def _esearch(query: str, *, retmax: int, retstart: int = 0) -> tuple[list[str], 
         "retmode": "json",
         "retmax": int(retmax),
         "retstart": int(retstart),
+        **_eutils_identity(),
     })
     data = _fetch_json(f"{EUTILS}/esearch.fcgi?{params}")
     payload = (data or {}).get("esearchresult") or {}
@@ -870,6 +915,7 @@ def _esummary(uids: list[str]) -> list[dict]:
             "db": "gds",
             "id": ",".join(batch),
             "retmode": "json",
+            **_eutils_identity(),
         })
         data = _fetch_json(f"{EUTILS}/esummary.fcgi?{params}")
         result = (data or {}).get("result") or {}
@@ -1006,7 +1052,8 @@ def geo_search(term, species="all", study_type="all", min_samples=0,
     """GEO 系列检索（E-utilities esearch + esummary，中文化 + 空间转录组判定）。
 
     platform: all|visium|stereo|slideseq|10x|merfish —— 在客户端对 items 做平台过滤；
-    过滤后为空时回退未过滤结果，并在 notes 写「平台过滤未命中，已返回全部」。
+    平台过滤是严格的：不命中就返回空 + 提示（不再回退成全量无关数据）；
+    平台词还会并入检索式，从源头减少非空间记录。
     has_matrix / has_clinical: 可选布尔过滤（None/False 表示不过滤）。
 
     返回 {"total","page","items":[{gse,title,title_zh,summary,species,n_samples,
@@ -1042,6 +1089,9 @@ def geo_search(term, species="all", study_type="all", min_samples=0,
 
     needs_filter = (bool(has_clinical) or want_matrix or platform_key != "all"
                     or sort_mode != "relevance")
+    # 选了空间平台时，把平台词并进检索式（比事后过滤更准，也不会返回一堆非空间数据）
+    if platform_key != "all":
+        query_term = _with_platform_clause(query_term, platform_key)
     cascade = _cascade_terms(query_term)
     selected_term = cascade[0]
     selected_query = _build_query(selected_term, species, study_type, min_samples)
@@ -1051,9 +1101,12 @@ def geo_search(term, species="all", study_type="all", min_samples=0,
     relaxed_used: list[str] = []
     platform_note = ""
     if not needs_filter:
+        # 非过滤模式也多抓一点候选（默认 40）：先按空间相关度排序再分页，
+        # 否则纯疾病关键词的首屏会被非空间数据占满。
+        pool = max(limit * 4, 40)
         for index, candidate in enumerate(cascade):
             query = _build_query(candidate, species, study_type, min_samples)
-            ids, total, translation = _esearch(query, retmax=limit, retstart=page * limit)
+            ids, total, translation = _esearch(query, retmax=min(MAX_ESUMMARY_CANDIDATES, pool), retstart=0)
             selected_term, selected_query = candidate, query
             if total > 0:
                 relaxed_used = cascade[:index + 1]
@@ -1061,6 +1114,10 @@ def geo_search(term, species="all", study_type="all", min_samples=0,
                     break
         records = _esummary(ids)
         items = [_item_from_summary(record) for record in records]
+        # 空间工作台：默认把空间相关度高的排前面（不隐藏非空间记录，但别让它们占满首屏）
+        items.sort(key=lambda item: _SCORE_RANK.get(str(item.get("spatial_score") or "low"), 3))
+        start = page * limit
+        items = items[start:start + limit]
     else:
         # 过滤/排序需要候选池：抓一页更宽的候选再本地筛选+分页
         want = (page + 1) * limit
@@ -1081,15 +1138,19 @@ def geo_search(term, species="all", study_type="all", min_samples=0,
             items = [item for item in items if item.get("has_matrix")]
         if platform_key != "all":
             matched = [item for item in items if _match_platform(item, platform_key)]
-            if matched:
-                items = matched
-            else:
-                platform_note = "平台过滤未命中，已返回全部"
+            # 严格过滤：选了平台就只给该平台的数据；宁可空，也不要拿无关数据充数
+            items = matched
+            items.sort(key=lambda item: _SCORE_RANK.get(str(item.get("spatial_score") or "low"), 3))
+            if not matched:
+                platform_note = ("该平台没有命中：已按平台词收紧检索式，仍无结果。"
+                                 "可去掉平台筛选，或换更口语的关键词（如「胃癌 空间转录组」）")
         if sort_mode != "relevance":
             items = _sort_items(items, sort_mode)
         start = page * limit
+        total = len(items)          # 过滤后总数（分页按过滤后计数）
         items = items[start:start + limit]
-        total = len(items) if total == 0 else total
+        if platform_note:
+            total = 0 if not items and page == 0 else total
 
     if not items and not ids:
         raise EngineError("not_found", "没有检索到匹配的 GEO 系列：试试更宽泛的关键词（比如只写疾病名）或调整筛选条件")

@@ -2,7 +2,9 @@
 # 一个 Host 插件（/spatial HTTP 路由 + spatial agent 工具 + prompt section）
 # 加一个 Client 整页（main 槽 key=spatial，侧边栏 panellist 入口）。
 # id 与 name 必须等于包名 dsh-spatial：Client 模块 loader id 要与包名一致。
+# config.python：优先用装了 scanpy/squidpy 的专用解释器（没有就用宿主 python3 的降级实现）。
 - insert:
     - id: dsh-spatial
       name: 'dsh-spatial'
-      config: {}
+      config:
+        python: '/Users/dingyuntao/.dsh/runtimes/bio312/bin/python'

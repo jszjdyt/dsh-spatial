@@ -703,14 +703,42 @@ def coord_knn(coords, k: int = 6):
     return idx.astype(int), np.take_along_axis(d, idx, axis=1)
 
 
-def radius_graph(coords, radius: float | None = None, k_fallback: int = 6):
-    """半径邻接（每点至少有 k 个邻居时自动加大半径）。返回稀疏邻接（csr_matrix, 0/1）。"""
+def _labels_from_kwargs(n: int, kwargs: dict) -> np.ndarray | None:
+    """从关键字参数里取每行块的标签（兼容 slide=/slides=/group=/block= 等写法）。
+
+    只有长度与行数一致时才采用；否则返回 None（当作单块）。
+    """
+    for key in ("slide", "slide_id", "slides", "slide_ids", "library", "library_id",
+                "group", "groups", "block", "blocks", "batch"):
+        value = (kwargs or {}).get(key)
+        if value is None:
+            continue
+        try:
+            labels = np.asarray(list(value), dtype=object).ravel()
+        except TypeError:
+            continue
+        if labels.shape[0] == int(n):
+            return labels
+    return None
+
+
+def radius_graph(coords, radius: float | None = None, k_fallback: int = 6, **kwargs):
+    """半径邻接（每点至少有 k 个邻居时自动加大半径）。返回稀疏邻接（csr_matrix, 0/1）。
+
+    多切片数据用 ``slide=`` / ``group=`` / ``block=``（每行一个块标签）传入物理块，
+    邻接只在块内构造，避免「不同切片同坐标」被判成邻居（见 blocked_radius_graph）。
+    """
     from scipy import sparse
 
     arr = np.asarray(coords, dtype=float)
     n = arr.shape[0]
     if n < 2:
         return sparse.csr_matrix((n, n), dtype=float)
+    labels = _labels_from_kwargs(n, kwargs)
+    if labels is not None:
+        blocks, _names = block_indices(labels)
+        if len(blocks) > 1:
+            return blocked_radius_graph(arr, blocks, radius, k_fallback=k_fallback)
     r = float(radius) if radius and radius > 0 else estimate_radius(arr)
     d = np.sqrt(((arr[:, None, :] - arr[None, :, :]) ** 2).sum(axis=2))
     np.fill_diagonal(d, np.inf)
@@ -723,17 +751,312 @@ def radius_graph(coords, radius: float | None = None, k_fallback: int = 6):
     return sparse.csr_matrix(mask.astype(float))
 
 
-def spatial_weights(coords, radius: float | None = None) -> np.ndarray:
-    """行标准化的空间权重矩阵（用于 Moran's I / Geary's C）。"""
-    g = radius_graph(coords, radius)
+def spatial_weights(coords, radius: float | None = None, **kwargs) -> np.ndarray:
+    """行标准化的空间权重矩阵（用于 Moran's I / Geary's C）。
+
+    多切片数据用 ``slide=`` / ``group=`` / ``block=`` 传入物理块 → 块内建边（blocked_spatial_weights）。
+    """
+    from scipy import sparse
+
+    arr = np.asarray(coords, dtype=float)
+    n = arr.shape[0]
+    labels = _labels_from_kwargs(n, kwargs)
+    if labels is not None:
+        blocks, _names = block_indices(labels)
+        if len(blocks) > 1:
+            return blocked_spatial_weights(arr, blocks, radius)
+    g = radius_graph(arr, radius)
     g = g.tocsr().astype(float).copy()
     g.setdiag(0.0)
     g.eliminate_zeros()
     row = np.asarray(g.sum(axis=1)).ravel()
     row[row == 0] = 1.0
+    return sparse.diags(1.0 / row) @ g
+
+
+# ---------------------------------------------------------------------------
+# 多切片 / 物理块：空间邻接、中心化与置换都必须按切片（slide/library）分块
+#
+# 多个 Visium/Stereo 切片合并时，各自的图像像素坐标都从接近 (0,0) 开始，
+# 直接把全部 spot 放进同一个 KD-tree 会造出「同一坐标、不同切片」的假邻居。
+# 物理图（半径/kNN 邻接）必须按块分别构造；联合表达图（表达 kNN）才可以跨块。
+# 统计检验的置换也必须在块内做，否则会把切片间均值差当成空间信号。
+# ---------------------------------------------------------------------------
+
+#: 判定「物理切片」的列名（按优先级：物理坐标框 → 样本/供体）
+BLOCK_COLUMN_CANDIDATES = (
+    "slide", "slide_id", "library", "library_id", "slice", "slice_id",
+    "sample", "sample_id", "specimen", "specimen_id", "section", "capture_area",
+    "patient", "patient_id", "donor", "donor_id", "subject", "individual",
+    "tissue", "batch",
+)
+
+#: 视为缺失的标签
+_MISSING_LABELS = {"", "na", "nan", "none", "null", "<na>", "unknown", "na_", "missing"}
+
+
+def _sample_frame(ctx):
+    frame = (ctx or {}).get("sample_info") if isinstance(ctx, dict) else None
+    return frame if isinstance(frame, pd.DataFrame) else None
+
+
+def block_labels(ctx, preferred: str | None = None) -> tuple[np.ndarray, str | None, list[str]]:
+    """取每个 spot 的物理块（切片/样本）标签。
+
+    返回 ``(labels, key, warnings)``：``key=None`` 表示样本表里没有可用的切片列（单块）。
+    ``preferred`` 可显式指定列名（优先级最高，允许用分组列强行分块）。
+    """
+    warnings: list[str] = []
+    frame = _sample_frame(ctx)
+    n = len(frame) if frame is not None else len((ctx or {}).get("spots") or [])
+    if frame is None or n == 0:
+        return np.asarray(["all"] * n, dtype=object), None, warnings
+    key = None
+    if preferred and str(preferred) in frame.columns:
+        key = str(preferred)
+    else:
+        for candidate in BLOCK_COLUMN_CANDIDATES:
+            if candidate in frame.columns:
+                key = candidate
+                break
+    if key is None:
+        return np.asarray(["all"] * n, dtype=object), None, warnings
+    values = frame[key].tolist()
+    labels: list[str] = []
+    n_missing = 0
+    for value in values:
+        try:
+            missing = value is None or (isinstance(value, float) and not np.isfinite(value))
+        except Exception:  # noqa: BLE001
+            missing = value is None
+        text = "" if missing else str(value).strip()
+        if text.lower() in _MISSING_LABELS:
+            n_missing += 1
+            text = "(unassigned)"
+        labels.append(text)
+    if n_missing:
+        warnings.append(f"{n_missing} 个 spot 缺少「{key}」值，已归入同一块 (unassigned)")
+    return np.asarray(labels, dtype=object), key, warnings
+
+
+def block_indices(labels) -> tuple[list[np.ndarray], list[str]]:
+    """把块标签转成 (块索引列表, 块名列表)，块名按首次出现顺序。"""
+    arr = np.asarray([str(v) for v in labels], dtype=object)
+    names = list(dict.fromkeys(arr.tolist()))
+    return [np.where(arr == name)[0] for name in names], names
+
+
+def spatial_blocks(ctx, preferred: str | None = None):
+    """``ctx`` → ``(blocks, names, key, warnings)``；没有切片列时返回单个全量块。"""
+    labels, key, warnings = block_labels(ctx, preferred)
+    blocks, names = block_indices(labels)
+    n = len(labels)
+    # 没有可用列时只保留一个全量块（单切片数据，行为与旧版一致）
+    if key is None:
+        return [np.arange(n)], ["all"], None, warnings
+    return blocks, names, key, warnings
+
+
+def within_block_permutation(blocks, n: int, rng) -> np.ndarray:
+    """块内置换索引：块内打乱、块间不交换（多切片置换检验的正确零分布）。"""
+    perm = np.arange(int(n))
+    for idx in blocks or []:
+        idx = np.asarray(idx, dtype=int)
+        if idx.size > 1:
+            perm[idx] = idx[rng.permutation(idx.size)]
+    return perm
+
+
+def center_within_blocks(values, blocks):
+    """按块中心化（去掉切片间均值差，保留块内空间结构）。
+
+    支持 (n,) 或 (n, g) ndarray；单块时等价于整体中心化。
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.array(arr, dtype=np.float64, copy=True)
+    for idx in blocks or []:
+        idx = np.asarray(idx, dtype=int)
+        if idx.size == 0:
+            continue
+        if out.ndim == 1:
+            out[idx] = out[idx] - np.mean(arr[idx])
+        else:
+            out[idx] = out[idx] - np.mean(arr[idx], axis=0, keepdims=True)
+    if not blocks:
+        out = out - out.mean(axis=0, keepdims=True)
+    return out
+
+
+def _median_nn_distance(arr: np.ndarray) -> float | None:
+    """块内最近邻距离中位数（>12000 点时用 KD-tree，避免 O(n²)）。"""
+    arr = np.asarray(arr, dtype=float)
+    if arr.shape[0] < 3:
+        return None
+    if arr.shape[0] > 12000:
+        try:
+            from scipy.spatial import cKDTree
+
+            dist, _ = cKDTree(arr).query(arr, k=2)
+            nn = np.asarray(dist)[:, 1]
+        except Exception:  # noqa: BLE001
+            nn = np.sort(np.sqrt(((arr[:, None, :] - arr[None, :, :]) ** 2).sum(axis=2)), axis=1)[:, 1]
+    else:
+        nn = np.sort(np.sqrt(((arr[:, None, :] - arr[None, :, :]) ** 2).sum(axis=2)), axis=1)[:, 1]
+    nn = nn[np.isfinite(nn) & (nn > 0)]
+    if nn.size == 0:
+        return None
+    return float(np.median(nn))
+
+
+def blocked_radius_estimate(coords, blocks) -> float:
+    """按块估计邻接半径（各块 1.2×最近邻中位数的中位数）。
+
+    多个切片共享同一坐标范围时，直接对合并坐标估半径会得到 ≈0（最近邻是别的切片的同位置 spot）。
+    """
+    arr = np.asarray(coords, dtype=float)
+    vals: list[float] = []
+    for idx in blocks or []:
+        sub = arr[np.asarray(idx, dtype=int)]
+        med = _median_nn_distance(sub)
+        if med is not None and med > 0:
+            vals.append(med * 1.2)
+    if vals:
+        return float(max(np.median(vals), 1e-6))
+    return float(estimate_radius(arr))
+
+
+def blocked_coord_knn(coords, blocks, k: int = 6):
+    """块内 kNN：返回 ``(idx, dist, k_eff)``，邻居不跨块。
+
+    ``k_eff`` 取 ``min(k, 最小块大小-1)``，保证不需要哨兵填充；只有单点块会用自身索引占位
+    （该 spot 没有物理邻居，调用方可用 ``dist == inf`` 识别）。
+    """
+    arr = np.asarray(coords, dtype=float)
+    n = arr.shape[0]
+    sizes = [len(idx) for idx in blocks or [] if len(idx) > 0]
+    k_eff = int(max(1, min(int(k), (min(sizes) - 1) if sizes else int(k))))
+    idx_out = np.zeros((n, k_eff), dtype=int)
+    dist_out = np.full((n, k_eff), np.inf, dtype=float)
+    for block in blocks or []:
+        block = np.asarray(block, dtype=int)
+        if block.size == 0:
+            continue
+        if block.size == 1:
+            idx_out[block, :] = int(block[0])
+            continue
+        kk = int(min(k_eff, block.size - 1))
+        if block.size > 12000:
+            # 大块：cKDTree，避免 O(m²) 距离矩阵爆内存
+            try:
+                from scipy.spatial import cKDTree
+
+                dd_b, ii_b = cKDTree(arr[block]).query(arr[block], k=kk + 1)
+                dd_b = np.atleast_2d(dd_b)[:, 1:kk + 1]
+                ii_b = np.atleast_2d(ii_b)[:, 1:kk + 1]
+                idx_out[block, :kk] = block[ii_b]
+                dist_out[block, :kk] = dd_b
+            except Exception:  # noqa: BLE001 - KD-tree 失败时退回稠密实现
+                ii, dd = coord_knn(arr[block], kk)
+                idx_out[block, :kk] = block[ii]
+                dist_out[block, :kk] = dd
+        else:
+            ii, dd = coord_knn(arr[block], kk)
+            idx_out[block, :kk] = block[ii]
+            dist_out[block, :kk] = dd
+        if kk < k_eff:
+            idx_out[block, kk:] = block[:, None]
+    return idx_out, dist_out, k_eff
+
+
+def blocked_radius_graph(coords, blocks, radius: float | None = None, k_fallback: int = 6):
+    """按块构造半径邻接（块内建边），返回全局 csr 邻接矩阵（0/1，对称）。"""
     from scipy import sparse
 
+    arr = np.asarray(coords, dtype=float)
+    n = arr.shape[0]
+    if n < 2:
+        return sparse.csr_matrix((n, n), dtype=float)
+    r = float(radius) if radius and float(radius) > 0 else blocked_radius_estimate(arr, blocks)
+    rows_all: list[np.ndarray] = []
+    cols_all: list[np.ndarray] = []
+    data_all: list[np.ndarray] = []
+    for block in blocks or [np.arange(n)]:
+        block = np.asarray(block, dtype=int)
+        if block.size < 2:
+            continue
+        sub = arr[block]
+        if sub.shape[0] > 12000:
+            g = _radius_graph_large_common(sub, r, k_fallback)
+        else:
+            g = radius_graph(sub, r, k_fallback=k_fallback)
+        coo = g.tocoo()
+        rows_all.append(block[coo.row])
+        cols_all.append(block[coo.col])
+        data_all.append(np.asarray(coo.data, dtype=float))
+    if not rows_all:
+        return sparse.csr_matrix((n, n), dtype=float)
+    rows = np.concatenate(rows_all)
+    cols = np.concatenate(cols_all)
+    data = np.concatenate(data_all)
+    return sparse.csr_matrix((data, (rows, cols)), shape=(n, n))
+
+
+def _radius_graph_large_common(arr: np.ndarray, radius: float, k_fallback: int = 6):
+    """大块半径邻接（cKDTree；邻居不足 k 的点补 kNN，与 radius_graph 规则一致）。"""
+    from scipy import sparse
+    from scipy.spatial import cKDTree
+
+    arr = np.asarray(arr, dtype=float)
+    n = arr.shape[0]
+    tree = cKDTree(arr)
+    pairs = tree.query_pairs(r=float(radius), output_type="ndarray")
+    if pairs.size:
+        rows = np.concatenate([pairs[:, 0], pairs[:, 1]])
+        cols = np.concatenate([pairs[:, 1], pairs[:, 0]])
+    else:
+        rows = np.empty(0, dtype=int)
+        cols = np.empty(0, dtype=int)
+    graph = sparse.coo_matrix((np.ones(rows.size), (rows, cols)), shape=(n, n)).tocsr()
+    degree = np.asarray(graph.sum(axis=1)).ravel()
+    need = np.where(degree < max(1, min(int(k_fallback), n - 1)))[0]
+    if need.size:
+        k = int(min(int(k_fallback), n - 1))
+        _dist, idx = tree.query(arr[need], k=k + 1)
+        idx = np.atleast_2d(idx)
+        graph = graph.tolil()
+        for row_i, point in enumerate(need):
+            for col_j in np.atleast_1d(idx[row_i])[1:]:
+                graph[int(point), int(col_j)] = 1.0
+        graph = graph.tocsr()
+    return graph
+
+
+def blocked_spatial_weights(coords, blocks, radius: float | None = None):
+    """按块构造并行标准化的空间权重矩阵（Moran's I / Geary's C 用）。"""
+    from scipy import sparse
+
+    g = blocked_radius_graph(coords, blocks, radius).tocsr().astype(float).copy()
+    g.setdiag(0.0)
+    g.eliminate_zeros()
+    row = np.asarray(g.sum(axis=1)).ravel()
+    row[row == 0] = 1.0
     return sparse.diags(1.0 / row) @ g
+
+
+def block_edge_counts(graph, blocks) -> dict:
+    """统计邻接矩阵（或权重矩阵）的块内/跨块边数（诊断与回归测试用）。"""
+    from scipy import sparse
+
+    g = sparse.csr_matrix(graph)
+    g = g.tocoo()
+    labels = np.empty(g.shape[0], dtype=int)
+    for i, block in enumerate(blocks or []):
+        labels[np.asarray(block, dtype=int)] = i
+    mask = g.data != 0
+    rows, cols = g.row[mask], g.col[mask]
+    n_cross = int(np.sum(labels[rows] != labels[cols]))
+    return {"n_edges": int(rows.size), "n_within": int(rows.size - n_cross), "n_cross": n_cross,
+            "cross_fraction": float(n_cross / rows.size) if rows.size else 0.0}
 
 
 def scatter_spatial(ax, ctx, values=None, *, labels=None, cmap=None, point_size: float = 8.0,

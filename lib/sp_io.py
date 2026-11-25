@@ -361,10 +361,21 @@ def _find_visium_matrix(root: str) -> tuple[str, str]:
         candidate = os.path.join(root, name)
         if os.path.exists(candidate):
             return "h5", candidate
-    for name in ("filtered_feature_bc_matrix", "raw_feature_bc_matrix"):
+    for name in ("filtered_feature_bc_matrix", "raw_feature_bc_matrix",
+                 "filtered_gene_bc_matrices", "raw_gene_bc_matrices"):
         candidate = os.path.join(root, name)
-        if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "matrix.mtx.gz")):
+        if os.path.isdir(candidate) and (
+                os.path.exists(os.path.join(candidate, "matrix.mtx.gz"))
+                or os.path.exists(os.path.join(candidate, "matrix.mtx"))):
             return "mtx", candidate
+        # v1 布局：filtered_gene_bc_matrices/<genome>/matrix.mtx
+        if os.path.isdir(candidate):
+            for sub in sorted(os.listdir(candidate)):
+                subdir = os.path.join(candidate, sub)
+                if os.path.isdir(subdir) and (
+                        os.path.exists(os.path.join(subdir, "matrix.mtx.gz"))
+                        or os.path.exists(os.path.join(subdir, "matrix.mtx"))):
+                    return "mtx", subdir
     # 上级 outs/ 目录情况：root 可能是 spatial/ 本身
     parent = os.path.dirname(root.rstrip(os.sep))
     if parent and parent != root:
@@ -389,22 +400,73 @@ def _find_spatial_dir(root: str) -> str | None:
     return None
 
 
-def _read_visium_positions(spatial_dir: str) -> tuple[list[str], np.ndarray, dict]:
-    """读 tissue_positions*.csv：barcode,in_tissue,array_row,array_col,pxl_row_in_fullres,pxl_col_in_fullres。"""
-    path = None
-    for name in VISIUM_POSITION_NAMES:
+#: Visium 图像 → （scalefactor 键, 坐标语义）
+_VISIUM_IMAGE_PLAN = (
+    ("tissue_hires_image.png", "tissue_hires_scalef", "hires", "visium_hires"),
+    ("tissue_lowres_image.png", "tissue_lowres_scalef", "lowres", "visium_lowres"),
+    ("tissue_image.png", None, "custom", "pixel"),
+)
+
+
+def _visium_positions_file(spatial_dir: str) -> tuple[str, str]:
+    """找 tissue_positions 文件并判定 Visium 输出版本：返回 (path, version)。
+
+    * v2（Space Ranger ≥ 2.0）：``tissue_positions.csv``（带表头）；
+    * v1（Space Ranger 1.x）：``tissue_positions_list.csv``（无表头，6 列固定顺序）。
+    """
+    for name, version in (("tissue_positions.csv", "v2"),):
         candidate = os.path.join(spatial_dir, name)
         if os.path.exists(candidate):
-            path = candidate
-            break
-    if not path:
-        raise EngineError("not_found", f"{spatial_dir} 里没有 tissue_positions*.csv")
+            return candidate, version
+    for name in ("tissue_positions_list.csv", "tissue_positions_list.txt"):
+        candidate = os.path.join(spatial_dir, name)
+        if os.path.exists(candidate):
+            head = _read_text(candidate, limit=4096)
+            first = next((line for line in head.splitlines() if line.strip()), "")
+            # 少数导出工具会在 v1 文件上也加表头：有表头就按 v2 语义解析
+            version = "v2" if "barcode" in first.lower() else "v1"
+            return candidate, version
+    raise EngineError("not_found", f"{spatial_dir} 里没有 tissue_positions*.csv")
+    # pragma: no cover - 上面必然 raise 或 return
+
+
+def _read_visium_positions(spatial_dir: str, scale_key: str | None = "tissue_hires_scalef",
+                           scale_override: float | None = None) -> tuple[list[str], np.ndarray, dict]:
+    """读 tissue_positions*.csv 并校验 Visium 输出版本/列。
+
+    坐标 = ``pxl_col/row_in_fullres × 实际使用的那张图的 scalefactor``：
+    scalefactor 由调用方按「真正会叠加的组织图」传入（hires → tissue_hires_scalef，
+    lowres → tissue_lowres_scalef），**不得**在只有低分辨率图时误乘 hires 比例。
+
+    非法输出（缺 pxl_row/col 列、v1 列数不足、坐标为全 NaN）→ ``bad_request`` 可读中文。
+    """
+    path, version = _visium_positions_file(spatial_dir)
     head = _read_text(path, limit=4096)
-    has_header = "barcode" in head.splitlines()[0].lower() if head.splitlines() else False
+    first = next((line for line in head.splitlines() if line.strip()), "")
+    has_header = "barcode" in first.lower()
     if has_header:
-        frame = pd.read_csv(path)
+        try:
+            frame = pd.read_csv(path)
+        except Exception as error:  # noqa: BLE001
+            raise EngineError("bad_request", f"读取 Visium 坐标表失败（{os.path.basename(path)}）：{error}")
         frame.columns = [str(col).strip() for col in frame.columns]
+        required = ("barcode", "pxl_row_in_fullres", "pxl_col_in_fullres")
+        missing = [col for col in required if col not in frame.columns]
+        if missing:
+            raise EngineError(
+                "bad_request",
+                f"Visium 输出版本异常（{os.path.basename(path)}，判定为 {version}）：缺列 "
+                + "、".join(missing)
+                + "。请确认给的是 Space Ranger outs/ 目录（spatial/tissue_positions*.csv 需含 "
+                  "pxl_row_in_fullres/pxl_col_in_fullres）")
     else:
+        columns = [col for col in re.split(r"[\t,]", first.strip()) if col != ""]
+        if len(columns) < 6:
+            raise EngineError(
+                "bad_request",
+                f"Visium 输出版本异常（{os.path.basename(path)}，判定为 {version}）："
+                f"无表头的坐标表应有 6 列（barcode,in_tissue,array_row,array_col,"
+                f"pxl_row_in_fullres,pxl_col_in_fullres），实际 {len(columns)} 列")
         frame = pd.read_csv(path, header=None,
                             names=["barcode", "in_tissue", "array_row", "array_col",
                                    "pxl_row_in_fullres", "pxl_col_in_fullres"])
@@ -412,44 +474,95 @@ def _read_visium_positions(spatial_dir: str) -> tuple[list[str], np.ndarray, dic
     if "in_tissue" in frame.columns:
         in_tissue = pd.to_numeric(frame["in_tissue"], errors="coerce").fillna(0)
         frame = frame.loc[in_tissue > 0]
-    scale = 1.0
+    # scalefactor：显式覆盖 > 实际使用图像的 scalefactor 键 > 不缩放（1.0，并写 warning）
+    warnings: list[str] = []
+    factors: dict = {}
     scalefactors_path = os.path.join(spatial_dir, "scalefactors_json.json")
     if os.path.exists(scalefactors_path):
         try:
             with open(scalefactors_path, "r", encoding="utf-8") as handle:
-                factors = json.load(handle)
-            scale = float(factors.get("tissue_hires_scalef") or 1.0)
+                factors = dict(json.load(handle))
         except Exception:  # noqa: BLE001
-            scale = 1.0
+            factors = {}
+            warnings.append("scalefactors_json.json 解析失败：坐标按 fullres 像素使用（未缩放）")
+    scale = 1.0
+    applied_key = None
+    scale_applied = False
+    if scale_override is not None:
+        try:
+            candidate = float(scale_override)
+        except (TypeError, ValueError):
+            candidate = 0.0
+        if np.isfinite(candidate) and candidate > 0:
+            scale = candidate
+            scale_applied = True
+            applied_key = "visium_scale(参数覆盖)"
+    elif scale_key and factors:
+        try:
+            candidate = float(factors.get(scale_key) or 0)
+        except (TypeError, ValueError):
+            candidate = 0.0
+        if np.isfinite(candidate) and candidate > 0:
+            scale = candidate
+            scale_applied = True
+            applied_key = scale_key
+        else:
+            warnings.append(
+                f"scalefactors_json.json 里缺有效的 {scale_key}：坐标按 fullres 像素使用（未缩放）")
+    elif not factors:
+        warnings.append(
+            "没有找到可用的 scalefactors_json.json：坐标按 fullres 像素使用（未缩放）")
     x = pd.to_numeric(frame.get("pxl_col_in_fullres"), errors="coerce").to_numpy(dtype=np.float32) * scale
     y = pd.to_numeric(frame.get("pxl_row_in_fullres"), errors="coerce").to_numpy(dtype=np.float32) * scale
     keep = np.isfinite(x) & np.isfinite(y)
+    if not keep.any():
+        raise EngineError("bad_request",
+                          f"Visium 坐标表里的 pxl_row/pxl_col_in_fullres 全是非数值（{os.path.basename(path)}）")
     frame = frame.loc[keep]
     coords = np.column_stack([x[keep], y[keep]]).astype(np.float32)
-    meta = {"coords_kind": "visium_hires", "scale": scale,
+    if scale_applied and applied_key == "tissue_lowres_scalef":
+        coords_kind = "visium_lowres"
+    elif scale_applied and applied_key == "tissue_hires_scalef":
+        coords_kind = "visium_hires"
+    elif scale_applied:
+        coords_kind = "visium_hires" if applied_key == "visium_scale(参数覆盖)" else "pixel"
+    else:
+        coords_kind = "pixel"
+    meta = {"coords_kind": coords_kind, "scale": float(scale), "scale_key": applied_key,
+            "scale_applied": bool(scale_applied), "visium_version": version,
+            "positions_file": os.path.basename(path),
+            "warnings": warnings,
             "array_row": frame.get("array_row", pd.Series(dtype=float)).tolist(),
             "array_col": frame.get("array_col", pd.Series(dtype=float)).tolist()}
     return [str(item) for item in frame["barcode"].tolist()], coords, meta
 
 
-def _find_tissue_image(spatial_dir: str) -> tuple[str | None, float | None]:
-    for name, scale_key in (
-        ("tissue_hires_image.png", "tissue_hires_scalef"),
-        ("tissue_lowres_image.png", "tissue_lowres_scalef"),
-        ("tissue_image.png", None),
-    ):
+def _find_tissue_image(spatial_dir: str) -> tuple[str | None, str | None, float | None, str | None]:
+    """按实际会叠加的组织图返回 ``(path, scale_key, scale, kind)``。
+
+    注意：只有低分辨率图时返回 lowres 的 scalefactor —— 坐标必须按低分辨率图缩放，
+    不能误用 hires 比例（否则坐标被放大 5×）。
+    """
+    scalefactors_path = os.path.join(spatial_dir, "scalefactors_json.json")
+    factors: dict = {}
+    if os.path.exists(scalefactors_path):
+        try:
+            with open(scalefactors_path, "r", encoding="utf-8") as handle:
+                factors = dict(json.load(handle))
+        except Exception:  # noqa: BLE001
+            factors = {}
+    for name, scale_key, kind, _coords_kind in _VISIUM_IMAGE_PLAN:
         candidate = os.path.join(spatial_dir, name)
-        if os.path.exists(candidate):
-            scale = None
-            scalefactors_path = os.path.join(spatial_dir, "scalefactors_json.json")
-            if os.path.exists(scalefactors_path) and scale_key:
-                try:
-                    with open(scalefactors_path, "r", encoding="utf-8") as handle:
-                        scale = float(json.load(handle).get(scale_key) or 0) or None
-                except Exception:  # noqa: BLE001
-                    scale = None
-            return candidate, scale
-    return None, None
+        if not os.path.exists(candidate):
+            continue
+        scale = None
+        if scale_key:
+            try:
+                scale = float(factors.get(scale_key) or 0) or None
+            except (TypeError, ValueError):
+                scale = None
+        return candidate, scale_key, scale, kind
+    return None, None, None, None
 
 
 def _image_extent(path: str | None, coords: np.ndarray) -> list[float] | None:
@@ -479,9 +592,22 @@ def load_visium(root: str, options: dict | None = None) -> dict:
     coords = None
     coords_kind = "visium_hires"
     image = None
+    visium_version = None
+    position_meta: dict = {}
     if spatial_dir:
-        labels, raw_coords, meta = _read_visium_positions(spatial_dir)
+        # 先确定「实际会叠加的组织图」→ 用那张图的 scalefactor 缩放坐标
+        image_path, image_scale_key, image_scale, image_kind = _find_tissue_image(spatial_dir)
+        scale_key = image_scale_key or "tissue_hires_scalef"
+        scale_override = options.get("visium_scale")
+        labels, raw_coords, meta = _read_visium_positions(
+            spatial_dir, scale_key=scale_key, scale_override=scale_override)
         coords_kind = meta.get("coords_kind", "visium_hires")
+        visium_version = meta.get("visium_version")
+        position_meta = dict(meta)
+        notes.append(
+            f"Visium 输出版本 {visium_version}（{meta.get('positions_file')}）；"
+            f"坐标缩放键 {meta.get('scale_key') or '无（fullres）'} = {float(meta.get('scale') or 1.0):.4f}")
+        warnings.extend(meta.get("warnings") or [])
         position = {str(label): index for index, label in enumerate(labels)}
         coords = np.full((len(spots), 2), np.nan, dtype=np.float32)
         matched = 0
@@ -497,21 +623,28 @@ def load_visium(root: str, options: dict | None = None) -> dict:
             if matched < len(spots):
                 warnings.append(f"{len(spots) - matched} 个 barcode 没有坐标（已被坐标分析排除，表达矩阵仍保留）")
             notes.append(f"Visium 坐标：{matched}/{len(spots)} 个 spot 匹配 tissue_positions")
-            if meta.get("scale") and abs(float(meta["scale"]) - 1.0) > 1e-9:
-                notes.append(f"坐标已按 tissue_hires_scalef={meta['scale']:.4f} 缩放")
-        image_path, image_scale = _find_tissue_image(spatial_dir)
+            if meta.get("scale_applied") and abs(float(meta.get("scale") or 1.0) - 1.0) > 1e-9:
+                notes.append(f"坐标已按 {meta.get('scale_key')}={float(meta['scale']):.4f} 缩放")
         if image_path:
-            image = {"path": image_path, "extent": _image_extent(image_path, raw_coords if raw_coords is not None else np.zeros((1, 2))),
-                     "scale": image_scale}
-            notes.append(f"已识别组织图：{os.path.basename(image_path)}")
+            image = {"path": image_path,
+                     "extent": _image_extent(image_path, raw_coords if raw_coords is not None else np.zeros((1, 2))),
+                     "scale": image_scale, "kind": image_kind, "scale_key": image_scale_key}
+            notes.append(f"已识别组织图：{os.path.basename(image_path)}（{image_kind}）")
     else:
         warnings.append("没有找到 spatial/ 目录：只能当表达矩阵用（空间分析需要坐标）")
     sample_info = pd.DataFrame(index=pd.Index(spots, name="spot"))
     if spatial_dir:
         try:
-            frame_meta = pd.read_csv(os.path.join(spatial_dir, "tissue_positions_list.csv"), header=None,
-                                     names=["barcode", "in_tissue", "array_row", "array_col",
-                                            "pxl_row_in_fullres", "pxl_col_in_fullres"])
+            positions_path, _version = _visium_positions_file(spatial_dir)
+            head = _read_text(positions_path, limit=1024)
+            if "barcode" in head.lower():
+                frame_meta = pd.read_csv(positions_path)
+                frame_meta.columns = [str(col).strip() for col in frame_meta.columns]
+            else:
+                frame_meta = pd.read_csv(positions_path, header=None,
+                                         names=["barcode", "in_tissue", "array_row", "array_col",
+                                                "pxl_row_in_fullres", "pxl_col_in_fullres"])
+            frame_meta["barcode"] = frame_meta["barcode"].astype(str)
             frame_meta = frame_meta.set_index("barcode")
             keep_cols = [col for col in ("in_tissue", "array_row", "array_col") if col in frame_meta.columns]
             if keep_cols:
@@ -537,6 +670,7 @@ def load_visium(root: str, options: dict | None = None) -> dict:
         "genes": genes,
         "spots": spots,
         "coords": coords,
+        "coords_kind": coords_kind,
         "X_kind": _value_kind(dense),
         "counts": dense.astype(np.float32) if _value_kind(dense) == "counts" else None,
         "sample_info": sample_info,
@@ -544,7 +678,12 @@ def load_visium(root: str, options: dict | None = None) -> dict:
         "notes": notes,
         "warnings": warnings,
         "meta": {"format": "visium", "coords_kind": coords_kind,
-                 "spatial_dir": spatial_dir, "image": image},
+                 "spatial_dir": spatial_dir, "image": image,
+                 "visium_version": visium_version,
+                 "scale": position_meta.get("scale"),
+                 "scale_key": position_meta.get("scale_key"),
+                 "scale_applied": position_meta.get("scale_applied"),
+                 "positions_file": position_meta.get("positions_file")},
     }
 
 
@@ -564,10 +703,12 @@ def load_h5ad(path: str, options: dict | None = None) -> dict:
         raise EngineError("bad_request", f"读取 h5ad 失败：{error}")
     coords = None
     coords_kind = "generic"
+    coords_source = None
     try:
         if "spatial" in getattr(adata, "obsm", {}):
             coords = np.asarray(adata.obsm["spatial"], dtype=np.float32)[:, :2]
             coords_kind = "pixel"
+            coords_source = "obsm['spatial']"
         else:
             obs = adata.obs
             lowered = {str(col).lower(): str(col) for col in obs.columns}
@@ -581,6 +722,7 @@ def load_h5ad(path: str, options: dict | None = None) -> dict:
                         pd.to_numeric(obs[lowered[cy]], errors="coerce").to_numpy(dtype=np.float32),
                     ])
                     coords_kind = "pixel" if "pxl" in cx else "generic"
+                    coords_source = f"obs({lowered[cx]},{lowered[cy]})"
                     break
     except Exception:  # noqa: BLE001
         coords = None
@@ -604,6 +746,7 @@ def load_h5ad(path: str, options: dict | None = None) -> dict:
             warnings.append("坐标行数与细胞数不一致，已忽略坐标")
             coords = None
     image = None
+    scalefactors_note = None
     try:
         uns = dict(adata.uns) if hasattr(adata, "uns") else {}
         for key in ("spatial", "image", "images"):
@@ -611,16 +754,84 @@ def load_h5ad(path: str, options: dict | None = None) -> dict:
             if isinstance(value, dict) and value.get("path"):
                 image = {"path": str(value["path"]), "extent": value.get("extent"), "scale": value.get("scale")}
                 break
+        # Visium 风格 h5ad：uns["spatial"][library_id] 里带 scalefactors（坐标通常是 fullres/hires 像素）
+        spatial_uns = uns.get("spatial")
+        if isinstance(spatial_uns, dict) and spatial_uns:
+            scale_keys = []
+            for lib, entry in spatial_uns.items():
+                if isinstance(entry, dict) and isinstance(entry.get("scalefactors"), dict):
+                    scale_keys = sorted(entry["scalefactors"].keys())
+                    break
+            if scale_keys:
+                scalefactors_note = (f"uns['spatial'] 里带 scalefactors（{', '.join(scale_keys[:6])}）："
+                                     "坐标按文件里 obsm['spatial'] 的原始像素使用，未二次缩放")
     except Exception:  # noqa: BLE001
         image = None
+    if scalefactors_note:
+        notes.append(scalefactors_note)
+
+    # ---- 矩阵标度 & counts 层（P0：X=lognorm + layers["counts"] 时不能丢掉 counts）----
     kind = _value_kind(dense)
+    finite_vals = dense[np.isfinite(dense)]
+    if kind == "counts":
+        matrix_scale = "counts"
+    elif kind == "lognorm":
+        matrix_scale = "lognorm"
+    elif finite_vals.size and float(finite_vals.min()) < 0:
+        matrix_scale = "scaled"
+    else:
+        matrix_scale = "unknown"
+    counts = None
+    counts_layer = None
+    counts_source = None
+    layers = getattr(adata, "layers", None) or {}
+    for name in ("counts", "count", "raw_counts", "umi_counts", "counts_raw"):
+        if name not in layers:
+            continue
+        try:
+            layer = layers[name]
+            if hasattr(layer, "toarray"):
+                layer = layer.toarray()
+            candidate = np.asarray(layer, dtype=np.float32)
+        except Exception:  # noqa: BLE001
+            continue
+        if candidate.shape != dense.shape or candidate.size == 0:
+            warnings.append(f"h5ad 的 layers[{name}] 形状 {candidate.shape} 与 X {dense.shape} 不一致，已忽略")
+            continue
+        counts = candidate
+        counts_layer = name
+        counts_source = f'layers["{name}"]'
+        break
+    if counts is None and kind == "counts":
+        counts = dense
+        counts_source = "X"
+    if counts is not None:
+        finite_counts = counts[np.isfinite(counts)]
+        if finite_counts.size and (finite_counts.min() < 0
+                                   or not np.allclose(finite_counts, np.round(finite_counts), atol=1e-6)):
+            warnings.append(
+                f"{counts_source} 不是非负整数 counts（min={float(finite_counts.min()):.3g}）："
+                "RCTD 等需要原始 counts 的方法会在使用前再校验")
+        notes.append(f"保留原始 counts：{counts_source}（{counts.shape[0]} × {counts.shape[1]}）")
+    elif matrix_scale in ("lognorm", "scaled"):
+        warnings.append(
+            "h5ad 的 X 已 log/标准化，但没有 layers['counts']（或 raw/counts 层）："
+            "RCTD 等需要原始 counts 的方法缺前置；如需 counts 请在导出 h5ad 时保留 counts 层")
+    if coords is None:
+        coords_source = None
     return {
         "format": "h5ad",
         "X": dense, "genes": genes, "spots": spots, "coords": coords,
-        "X_kind": kind, "counts": dense if kind == "counts" else None,
+        "X_kind": kind, "counts": counts,
         "sample_info": sample_info, "image": image,
         "notes": notes, "warnings": warnings,
-        "meta": {"format": "h5ad", "coords_kind": coords_kind},
+        "meta": {"format": "h5ad", "coords_kind": coords_kind,
+                 "coords_source": coords_source,
+                 "matrix_scale": matrix_scale,
+                 "counts_layer": counts_layer,
+                 "counts_source": counts_source,
+                 "x_kind": kind,
+                 "has_scalefactors": bool(scalefactors_note)},
     }
 
 
@@ -818,6 +1029,10 @@ def load_geo_series(path: str, options: dict | None = None, workdir: str | None 
     samples = [str(col).strip('"') for col in frame.columns]
     genes = [str(item).strip('"') for item in frame.index]
     dense = np.asarray(frame.to_numpy(dtype=np.float32).T)  # → 样本 × 基因
+    if dense.size == 0 or dense.shape[0] == 0 or dense.shape[1] == 0:
+        raise prerequisite(
+            f"series matrix 里没有表达数据表（只有 !Series_/!Sample_ 头部）：{os.path.basename(path)}。"
+            "这种 GSE 的数据在 suppl/ 的补充文件里（如 *RAW.tar、*counts.csv），请下那些文件再导入")
     chars: dict[str, list[str]] = {}
     for line in lines[:start - 1]:
         if line.startswith("!Sample_characteristics_ch1"):

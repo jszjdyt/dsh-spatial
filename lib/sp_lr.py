@@ -138,11 +138,25 @@ def _labels(ctx, key: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def _spatial_blocks(ctx):
+    """物理块（切片/样本）：返回 (blocks, names, key, warnings)。"""
+    return sc.spatial_blocks(ctx)
+
+
 def _neighbour_matrix(ctx, k: int) -> np.ndarray:
+    """kNN 邻居索引。
+
+    多切片（物理块 > 1）时邻居只在切片内取（``sp_common.blocked_coord_knn``）：
+    不同切片的相似坐标不是空间邻居，跨片邻居会直接污染簇对通讯强度。
+    """
     coords = ctx.get("coords")
     if coords is None:
         raise sc.prerequisite("空间通讯需要空间坐标")
     coords = np.asarray(coords, dtype=float)[:, :2]
+    blocks = _spatial_blocks(ctx)[0]
+    if len(blocks) > 1:
+        idx, _dist, _k_eff = sc.blocked_coord_knn(coords, blocks, k)
+        return np.asarray(idx, dtype=int)
     return sc.coord_knn(coords, k)[0]
 
 
@@ -196,6 +210,8 @@ def _analyse(ctx, params) -> dict:
     if not pairs:
         raise sc.prerequisite("内置 LR 库里没有任何一对同时出现在本数据集的基因中（基因命名可能是 Ensembl ID）")
     neighbours = _neighbour_matrix(ctx, k_neighbors)
+    blocks, _block_names, block_key, _block_warn = _spatial_blocks(ctx)
+    multi_block = len(blocks) > 1
     position = {name: i for i, name in enumerate(uniq)}
     codes = np.array([position[str(item)] for item in labels], dtype=int)
     l_idx = np.array([p[3] for p in pairs], dtype=int)
@@ -210,7 +226,11 @@ def _analyse(ctx, params) -> dict:
     rng = np.random.default_rng(0)
     null_values = []
     for _ in range(max(0, n_perms)):
-        perm = rng.permutation(codes)
+        if multi_block:
+            # 多切片：只在切片内打乱簇标签（不交换切片间标签）
+            perm = codes[sc.within_block_permutation(blocks, codes.size, rng)]
+        else:
+            perm = rng.permutation(codes)
         F_perm_all = _fractions(X, perm, len(uniq), np.concatenate([l_idx, r_idx]))
         F_perm_all = F_perm_all / np.maximum(F_perm_all.max(), 1e-9)
         W_perm = _cluster_adjacency(labels, neighbours, uniq) if False else _cluster_adjacency_permuted(perm, neighbours, len(uniq))
@@ -252,7 +272,9 @@ def _analyse(ctx, params) -> dict:
         frame["p_adj"] = frame["p"]
     frame = frame.head(max(10, top_n * 10)).reset_index(drop=True)
     return {"frame": frame, "uniq": uniq, "observed": observed, "pairs": pairs,
-            "W": W, "labels": labels, "n_perms": n_perms}
+            "W": W, "labels": labels, "n_perms": n_perms,
+            "blocked": bool(multi_block), "block_key": block_key,
+            "n_blocks": int(len(blocks))}
 
 
 def _cluster_adjacency_permuted(perm: np.ndarray, neighbours: np.ndarray, k: int) -> np.ndarray:
@@ -307,6 +329,10 @@ def analysis_ligrec(ctx, params, outdir):
                                  for _, row in frame.head(3).iterrows()),
         f"p_adj<0.05 的候选：{significant} 条",
     ]
+    if out.get("blocked"):
+        bullets.append(
+            f"多切片（{out.get('n_blocks')} 个，列「{out.get('block_key')}」）：邻居只在切片内取，"
+            "簇标签置换也限制在切片内")
     return sc.result(
         summary={"title": "空间配体-受体", "bullets": bullets,
                  "metrics": {"n_pairs": len(out["pairs"]), "n_clusters": len(uniq),

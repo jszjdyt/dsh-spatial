@@ -1,12 +1,38 @@
 # 安装
 
-## 依赖（本机 python3 已具备，无需安装）
+## 依赖
+
+### 推荐：专用生物信息环境（scanpy + squidpy）
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh     # 或已有 uv
+uv venv --python 3.12 ~/.dsh/runtimes/bio312
+uv pip install --python ~/.dsh/runtimes/bio312/bin/python \
+  "numpy<2.4" "pandas<3" scipy scikit-learn matplotlib seaborn anndata \
+  scanpy squidpy umap-learn leidenalg igraph harmonypy scikit-misc \
+  statsmodels openpyxl h5py networkx lifelines pillow certifi matchms
+```
+
+> 注意 `numpy<2.4`：numpy 2.5 与 numba 不兼容，uv 会去源码编译 numba 而卡住。
+
+插件引擎会**自动优先** `~/.dsh/runtimes/bio312/bin/python`（其次 `~/.dsh/runtimes/bio/bin/python`），也可以在插件配置里写 `python: /绝对路径`。
+
+### 回退环境（宿主自带 python3）
+
+```bash
 
 ```bash
 python3 -c "import numpy,pandas,scipy,sklearn,matplotlib,statsmodels,openpyxl,h5py,anndata,lifelines,PIL,certifi"
 ```
 
-缺包时：`python3 -m pip install -r requirements.txt`（不强制，插件自带降级）。
+没有 scanpy/squidpy 时插件会回退到等价内置实现（method 标"回退内置实现"），功能可用但精度/口径不如主流包。
+
+### R（可选：反卷积用 RCTD）
+
+```bash
+Rscript -e 'remotes::install_github("dmcable/spacexr")'   # Bioconductor 主站被墙时可用 GitHub
+Rscript -e 'requireNamespace("spacexr", quietly=TRUE)'
+```
 
 ## 安装插件
 
