@@ -54,5 +54,17 @@
     "moran",
     "deconvolution"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "ci": {
+    "node": [
+      "test/client-logic.test.mjs",
+      "test/test_stats_contract.mjs"
+    ],
+    "python": [
+      "test/test_p0_deconv_na.py",
+      "test/test_p0_io_counts_scale.py",
+      "test/test_p0_pseudoreplication.py",
+      "test/test_p0_slice_adjacency.py"
+    ]
+  }
 }

@@ -552,6 +552,18 @@
     recordsAuditScore: '自检得分',
     recordsAuditEmpty: '点「运行自检」检查流程完整性、坐标与质控情况',
     recordsExport: '导出',
+    contractTitle: '统计口径',
+    contractHint: '口径 = 数据集现状 + 最近一次分析的设计/检验/校正；随状态刷新，导出的 protocol 同源。',
+    contractOk: '可引用',
+    contractWarn: '待注意',
+    contractNoResult: '还没有分析记录',
+    contractDesign: '设计',
+    contractInference: '最近分析',
+    contractCaveats: '引用前必须处理',
+    contractGroups: '分组',
+    contractScale: '尺度',
+    contractSpots: 'spot / 基因',
+    contractSamples: '切片 / 供体',
     recordsAnalysis: '分析目录',
     recordsQuickExports: '快速导出',
     recordsExporting: '导出中…',
@@ -923,6 +935,18 @@
     recordsAuditScore: 'Score',
     recordsAuditEmpty: 'Run the check to inspect pipeline completeness, coordinates and QC',
     recordsExport: 'Export',
+    contractTitle: 'Statistical contract',
+    contractHint: 'Contract = dataset state + design/test/correction of the latest analysis; refreshes with state and matches the exported protocol.',
+    contractOk: 'Citable',
+    contractWarn: 'Needs attention',
+    contractNoResult: 'No analysis yet',
+    contractDesign: 'Design',
+    contractInference: 'Latest analysis',
+    contractCaveats: 'Fix before citing',
+    contractGroups: 'Groups',
+    contractScale: 'Scale',
+    contractSpots: 'Spots / genes',
+    contractSamples: 'Slices / donors',
     recordsAnalysis: 'Analyses',
     recordsQuickExports: 'Quick export',
     recordsExporting: 'Exporting…',
@@ -1736,6 +1760,85 @@
   }
 
   /** dataset 摘要归一化：服务端缺字段（老版本/引擎忙）时也能渲染。 */
+  /**
+   * 工作台口径契约 → UI 模型（缺失一律 null/空，不编默认值）。
+   * 数据来源：Host `lib/impl.mjs` 的 buildWorkbenchContract（引擎真实字段）。
+   */
+  function normalizeStatsContract(payload) {
+    var raw = payload && typeof payload === 'object' ? payload : null
+    if (!raw) return null
+    function objectOrEmpty(value) {
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+    }
+    function textList(value) {
+      return Array.isArray(value) ? value.map(function (entry) { return plainText(entry, 120) }).filter(Boolean) : []
+    }
+    function boolOrNull(value) {
+      if (value === undefined || value === null) return null
+      return value === true
+    }
+    var dataset = objectOrEmpty(raw.dataset)
+    var design = objectOrEmpty(raw.design)
+    var inference = raw.inference && typeof raw.inference === 'object' ? raw.inference : null
+    var identity = objectOrEmpty(raw.identity)
+    var nPerGroup = objectOrEmpty(design.n_per_group)
+    return {
+      schema: plainText(raw.schema || ''),
+      plugin: plainText(raw.plugin || ''),
+      pluginVersion: plainText(raw.plugin_version || ''),
+      okToCite: raw.ok_to_cite === true,
+      dataset: {
+        id: plainText(dataset.id || ''),
+        name: plainText(dataset.name || ''),
+        nSamples: asNumber(dataset.n_samples),
+        nGenes: asNumber(dataset.n_genes),
+        nSpots: asNumber(dataset.n_spots),
+        species: plainText(dataset.species || ''),
+        valueKind: plainText(dataset.value_kind || ''),
+        dataKind: plainText(dataset.data_kind || ''),
+        spatialMode: plainText(dataset.spatial_mode || ''),
+        coordsKind: plainText(dataset.coords_kind || ''),
+        hasCounts: boolOrNull(dataset.has_counts),
+        hasCoords: boolOrNull(dataset.has_coords),
+        fingerprint: plainText(dataset.import_fingerprint || ''),
+      },
+      design: {
+        groupKey: plainText(design.group_key || ''),
+        groups: textList(design.groups),
+        nPerGroup: nPerGroup,
+        donorKey: plainText(design.donor_key || ''),
+        nDonors: asNumber(design.n_donors),
+        sampleKey: plainText(design.sample_key || ''),
+        sampleColumns: textList(design.sample_columns),
+        clinicalColumns: textList(design.clinical_columns),
+      },
+      inference: inference ? {
+        lastStep: plainText(inference.last_step || ''),
+        ok: inference.ok !== false,
+        at: plainText(inference.at || ''),
+        ms: asNumber(inference.ms),
+        summary: plainText(inference.summary || ''),
+        method: objectOrEmpty(inference.method),
+        designParams: objectOrEmpty(inference.design),
+        fdr: objectOrEmpty(inference.fdr),
+      } : null,
+      recentAnalyses: Array.isArray(raw.recent_analyses) ? raw.recent_analyses.map(function (entry) {
+        var item = entry && typeof entry === 'object' ? entry : {}
+        return { analysis: plainText(item.analysis || ''), at: plainText(item.at || ''), ok: item.ok !== false }
+      }).filter(function (item) { return Boolean(item.analysis) }) : [],
+      identity: {
+        fingerprint: plainText(identity.fingerprint || ''),
+        createdAt: plainText(identity.created_at || ''),
+        nStepsDone: asNumber(identity.n_steps_done),
+        nHistory: asNumber(identity.n_history),
+      },
+      caveats: Array.isArray(raw.caveats) ? raw.caveats.map(function (entry) {
+        var item = entry && typeof entry === 'object' ? entry : {}
+        return { code: plainText(item.code || ''), level: plainText(item.level || 'info'), text: plainText(item.text || '') }
+      }).filter(function (item) { return Boolean(item.text) }) : [],
+    }
+  }
+
   function normalizeDataset(payload) {
     var raw = payload && typeof payload === 'object'
       ? (payload.dataset && typeof payload.dataset === 'object' ? payload.dataset : payload)
@@ -1824,6 +1927,7 @@
       notes: normalizeStringList(raw.notes),
       history: history,
       analyses_run: runs,
+      stats_contract: normalizeStatsContract(raw.stats_contract),
     }
   }
 
@@ -2576,6 +2680,7 @@
     normalizeTable: normalizeTable,
     normalizeResult: normalizeResult,
     normalizeDataset: normalizeDataset,
+    normalizeStatsContract: normalizeStatsContract,
     normalizePreview: normalizePreview,
     normalizeHealth: normalizeHealth,
     normalizeState: normalizeState,
@@ -2661,6 +2766,15 @@
       '.sp-badge-warn{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 42%,var(--dsw-alias-border-l1));background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 9%,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-state-warn-primary)}',
       '.sp-badge-bad{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 42%,var(--dsw-alias-border-l1));background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 9%,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-state-error-primary)}',
       '.sp-badge-reason{max-width:200px;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-state-error-primary);font-size:10.5px}',
+      '.sp-contract{display:flex;flex-direction:column;gap:5px}',
+      '.sp-contract-hint{font-size:11px;color:var(--dsw-alias-label-secondary);line-height:1.5}',
+      '.sp-contract-row{display:flex;gap:8px;font-size:12px;align-items:baseline}',
+      '.sp-contract-k{flex:0 0 88px;color:var(--dsw-alias-label-secondary)}',
+      '.sp-contract-v{flex:1 1 auto;color:var(--dsw-alias-label-primary);word-break:break-word}',
+      '.sp-contract-warn{margin-top:4px;padding:7px 9px;border-radius:8px;font-size:11.5px;line-height:1.5;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1)}',
+      '.sp-contract-warn-title{font-weight:600;margin-bottom:2px;color:var(--dsw-alias-state-warn-primary)}',
+      '.sp-contract-warn-item{color:var(--dsw-alias-label-primary)}',
+      '.sp-contract-info{margin-top:4px;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary)}',
       '.sp-chips{display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:0;flex:1 1 200px}',
       '.sp-chip{display:inline-flex;align-items:center;gap:5px;max-width:210px;height:23px;padding:0 9px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11.5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:border-color .14s ease,background .14s ease,color .14s ease}',
       '.sp-chip:hover:not(:disabled){border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary)}',
@@ -4649,6 +4763,99 @@
     // 中栏：记录（历史 + 自检 + 导出）/ 日志
     // ==========================================================================
 
+    /**
+     * 统计口径卡：数据集现状（spot/基因/切片·尺度·counts/坐标）+ 最近分析的设计/检验/校正
+     * + 引用前必须处理的项。数据来自 Host 的 buildWorkbenchContract（取不到的字段为 null）。
+     */
+    function StatsContractCard(props) {
+      var contract = props.contract || null
+      function kv(label, value) {
+        if (!value) return null
+        return h('div', { className: 'sp-contract-row' },
+          h('span', { className: 'sp-contract-k' }, label),
+          h('span', { className: 'sp-contract-v' }, value))
+      }
+      function joinCounts(map) {
+        var keys = Object.keys(map || {})
+        if (!keys.length) return ''
+        return keys.map(function (key) {
+          var count = map[key]
+          return key + ' ' + (count === null || count === undefined ? '?' : fmtNumber(count, 0))
+        }).join(' / ')
+      }
+      var badge = contract
+        ? h('span', { className: 'sp-badge ' + (contract.okToCite ? 'sp-badge-ok' : 'sp-badge-warn') },
+            h('span', { className: 'sp-badge-dot' }),
+            contract.okToCite ? T('contractOk') : T('contractWarn'))
+        : null
+      if (!contract) {
+        return h(SectionCard, { title: T('contractTitle'), extra: badge },
+          h('div', { className: 'sp-muted' }, T('contractHint')))
+      }
+      var dataset = contract.dataset || {}
+      var design = contract.design || {}
+      var inference = contract.inference
+      var warns = (contract.caveats || []).filter(function (item) { return item.level === 'warn' })
+      var infos = (contract.caveats || []).filter(function (item) { return item.level !== 'warn' })
+      var spotsText = [
+        dataset.nSpots !== null ? fmtNumber(dataset.nSpots, 0) : null,
+        dataset.nGenes !== null ? fmtNumber(dataset.nGenes, 0) : null,
+      ].filter(function (item) { return item !== null }).join(' / ')
+      var sampleParts = []
+      if (dataset.nSamples !== null) {
+        sampleParts.push(fmtNumber(dataset.nSamples, 0) + (design.sampleKey ? '（' + design.sampleKey + '）' : ''))
+      }
+      if (design.nDonors !== null) {
+        sampleParts.push(fmtNumber(design.nDonors, 0) + (design.donorKey ? '（' + design.donorKey + '）' : ''))
+      }
+      var samplesText = sampleParts.join(' · ')
+      var groupText = [
+        joinCounts(design.nPerGroup),
+        design.groupKey ? '（' + design.groupKey + '）' : '',
+      ].filter(Boolean).join(' ')
+      var scaleText = [
+        dataset.valueKind || '',
+        dataset.species || '',
+        dataset.hasCounts === true ? 'counts=yes' : (dataset.hasCounts === false ? 'counts=no' : ''),
+        dataset.hasCoords === true ? 'coords=yes' : (dataset.hasCoords === false ? 'coords=no' : ''),
+        dataset.spatialMode || '',
+      ].filter(Boolean).join(' · ')
+      var methodText = inference
+        ? Object.keys(inference.method || {}).map(function (key) { return key + '=' + inference.method[key] }).join(' · ')
+        : ''
+      var designText = inference
+        ? Object.keys(inference.designParams || {}).map(function (key) { return key + '=' + inference.designParams[key] }).join(' · ')
+        : ''
+      var fdrText = inference
+        ? Object.keys(inference.fdr || {}).map(function (key) { return key + '=' + inference.fdr[key] }).join(' · ')
+        : ''
+      var inferenceText = inference
+        ? [inference.lastStep, inference.ok ? T('completed') : T('failed'),
+            inference.ms !== null ? formatDuration(inference.ms) : '',
+            methodText, fdrText].filter(Boolean).join(' · ')
+        : T('contractNoResult')
+      return h(SectionCard, { title: T('contractTitle'), extra: badge },
+        h('div', { className: 'sp-contract' },
+          h('div', { className: 'sp-contract-hint' }, T('contractHint')),
+          kv(T('contractSpots'), spotsText || null),
+          kv(T('contractSamples'), samplesText),
+          kv(T('contractGroups'), groupText || null),
+          kv(T('contractScale'), scaleText || null),
+          kv(T('contractInference'), inferenceText),
+          kv(T('contractDesign'), designText || null),
+          warns.length
+            ? h('div', { className: 'sp-contract-warn' },
+              h('div', { className: 'sp-contract-warn-title' }, T('contractCaveats') + '（' + warns.length + '）'),
+              warns.map(function (item, index) {
+                return h('div', { key: 'warn-' + index, className: 'sp-contract-warn-item' }, '· ' + item.text)
+              }))
+            : null,
+          infos.length
+            ? h('div', { className: 'sp-contract-info' },
+              infos.map(function (item, index) { return h('div', { key: 'info-' + index }, '· ' + item.text) }))
+            : null))
+    }
+
     function RecordsTab(props) {
       var dataset = props.dataset
       var auditState = useState({ busy: false, error: '', audit: null })
@@ -4738,6 +4945,7 @@
               h('span', { className: 'sp-export-hint' }, state.file ? state.file : item.hint),
               state.error ? h('span', { className: 'sp-warn-text' }, state.error) : null)
           }))),
+        h(StatsContractCard, { contract: dataset ? dataset.stats_contract : null }),
         h(Notice, { text: T('auditHint') }))
     }
 

@@ -19,6 +19,8 @@ dsh-spatial — 数据集状态层（DESIGN §2.3 / §2.4 / §9）
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import time
@@ -69,6 +71,23 @@ _GROUP_COLUMN_PREFERENCE = (
 
 #: 这些列是"聚类结果"而不是实验分组，不能当 group_key
 _CLUSTER_LIKE_COLUMNS = {"clusters", "domains", "niches", "niche", "cluster", "domain", "leiden", "louvain"}
+
+#: 口径卡（stats contract）判定「取样单元」的 spot 级列名候选。
+#: 刻意不含 batch/tissue：技术批次与组织区域不是独立的生物学重复。
+STAT_UNIT_COLUMNS = (
+    "slide", "slide_id", "library", "library_id", "slice", "slice_id",
+    "sample", "sample_id", "specimen", "specimen_id", "section", "capture_area",
+    "donor", "donor_id", "patient", "patient_id", "subject", "individual",
+)
+
+#: 口径卡判定「供体」的 spot 级列名候选（与取样单元分开报）。
+STAT_DONOR_COLUMNS = (
+    "donor", "donor_id", "donorid", "patient", "patient_id",
+    "subject", "subject_id", "individual", "individual_id",
+)
+
+#: 统一视为缺失的标签（不计入样本/供体数）
+STAT_MISSING_LABELS = {"", "na", "nan", "none", "null", "<na>", "unknown", "missing"}
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +550,117 @@ class Dataset:
                 out.append(key)
         return out
 
+    # -- 口径卡（stats contract）用：取样单元 / 每组样本数 / 供体数 / 身份指纹 ----
+    def stat_column_key(self, candidates) -> str | None:
+        """sample_info 里第一个命中的候选列（真实列名，大小写不敏感）；没有返回 None。"""
+        frame = self.sample_info
+        if not isinstance(frame, pd.DataFrame):
+            return None
+        lowered = {str(name).strip().lower(): str(name) for name in frame.columns}
+        for candidate in candidates:
+            if candidate in lowered:
+                return lowered[candidate]
+        return None
+
+    def stat_unit_key(self) -> str | None:
+        """取样单元列（切片/样本/供体）；没有这类列时口径卡写 null，不拿 spot 冒充。"""
+        return self.stat_column_key(STAT_UNIT_COLUMNS)
+
+    def stat_donor_key(self) -> str | None:
+        return self.stat_column_key(STAT_DONOR_COLUMNS)
+
+    def _stat_clean_series(self, key: str | None):
+        """sample_info[key] 的字符串 Series（去缺失标签）；没有该列返回 None。"""
+        frame = self.sample_info
+        if not key or not isinstance(frame, pd.DataFrame) or key not in frame.columns:
+            return None
+        try:
+            series = frame[key].astype(str).str.strip()
+            return series[~series.str.lower().isin(STAT_MISSING_LABELS)]
+        except Exception:  # noqa: BLE001
+            return None
+
+    def n_slices(self) -> int | None:
+        """切片/取样单元数（生物学 n）；没有取样单元列返回 None。"""
+        series = self._stat_clean_series(self.stat_unit_key())
+        if series is None:
+            return None
+        value = int(series.nunique())
+        return value if value else None
+
+    def n_donors(self) -> int | None:
+        series = self._stat_clean_series(self.stat_donor_key())
+        if series is None:
+            return None
+        value = int(series.nunique())
+        return value if value else None
+
+    def group_counts(self) -> dict:
+        """每组切片/取样单元数（口径卡判断生物学重复的依据；取不到返回 {}，不猜）。"""
+        group_key = self.group_key
+        unit_key = self.stat_unit_key()
+        if not group_key or not unit_key:
+            return {}
+        frame = self.sample_info
+        if group_key not in frame.columns:
+            return {}
+        try:
+            pairs = frame[[unit_key, group_key]].astype(str)
+            pairs[unit_key] = pairs[unit_key].str.strip()
+            pairs[group_key] = pairs[group_key].str.strip()
+            pairs = pairs[
+                ~pairs[unit_key].str.lower().isin(STAT_MISSING_LABELS)
+                & ~pairs[group_key].str.lower().isin(STAT_MISSING_LABELS)
+            ]
+            if pairs.empty:
+                return {}
+            # 一个取样单元在一个分组里出现多次（多个 spot）只算 1 个单元
+            grouped = pairs.drop_duplicates().groupby(group_key)[unit_key].nunique()
+            return {str(group): int(count) for group, count in grouped.items()}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def stats_value_kind(self) -> str:
+        """矩阵尺度归一成契约 vocabulary：counts / log_expression / unknown。
+
+        刻意不叫 value_kind：sp_registry 里有 `getattr(dataset, "value_kind")` 的
+        兼容兜底，占用同名方法会让兜底拿到 bound method。
+        """
+        kind = str(self.X_kind or "").strip().lower()
+        if "lognorm" in kind or "log1p" in kind:
+            return "log_expression"
+        if kind.startswith("counts") or kind == "integer":
+            return "counts"
+        return kind or "unknown"
+
+    def import_fingerprint(self) -> str | None:
+        """导入身份指纹（数据身份可回查；算一次缓存，随 summary 轮询不重复计算）。
+
+        不是全矩阵内容哈希；覆盖来源/维度/首尾 spot 与基因名/样本信息列，
+        用来区分「同一个数据集」与「重新导入后同名数据集」。
+        """
+        cached = getattr(self, "_import_fingerprint", None)
+        if cached:
+            return str(cached)
+        try:
+            payload = {
+                "path": self.path,
+                "name": self.name,
+                "source_format": self.source_format,
+                "n_spots": self.n_spots,
+                "n_genes": self.n_genes,
+                "spots_head": [str(item) for item in self.spots[:5]],
+                "spots_tail": [str(item) for item in self.spots[-5:]],
+                "genes_head": [str(item) for item in self.genes[:5]],
+                "genes_tail": [str(item) for item in self.genes[-5:]],
+                "sample_columns": [str(name) for name in self.sample_info.columns],
+            }
+            text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+            self._import_fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            return self._import_fingerprint
+        except Exception:  # noqa: BLE001 - 指纹算不出来就写 null，不编
+            return None
+
     # -- 摘要 / 预览 ------------------------------------------------------
     def summary(self, history_limit: int = SUMMARY_HISTORY_LIMIT) -> dict:
         """DESIGN §2.4 dataset 摘要（键名逐字一致；history 返回截断到 20 条）。"""
@@ -566,6 +696,17 @@ class Dataset:
             "has_counts": self.has_counts,
             "X_kind": self.X_kind,
             "created_at": self.created_at,
+            # 口径卡（stats contract）需要「每组几个切片/几个供体」与矩阵尺度；
+            # 取不到的一律 None/{}，不猜（缺失由 Host 侧契约写进 caveats）。
+            "n_history": len(self.history),
+            "import_fingerprint": self.import_fingerprint(),
+            "slice_key": self.stat_unit_key(),
+            "n_slices": self.n_slices(),
+            "group_counts": self.group_counts(),
+            "donor_key": self.stat_donor_key(),
+            "n_donors": self.n_donors(),
+            "value_kind": self.stats_value_kind(),
+            "has_coords": self.coords is not None,
         }
         return jsonable(out)
 
